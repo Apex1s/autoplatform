@@ -10,9 +10,11 @@ on the host (Render) and as encrypted GitHub Actions secrets. `.env`, `.env.*` (
 `.env.example`), `*.local.txt` and `probe_results.json` are git-ignored.
 
 ## Design notes
-- `/admin/*` needs `ADMIN_TOKEN`; `/cron/*` needs `CRON_TOKEN`; in production `/metrics`
-  needs `METRICS_TOKEN` or `ADMIN_TOKEN` unless `METRICS_PUBLIC=true`. Tokens are compared
-  in constant time.
+- `/admin/*` needs `ADMIN_TOKEN`. `/cron/*` takes a GitHub Actions OIDC token, which is verified
+  with RS256 against GitHub's JWKS and pinned to this repo, `main`, the audience, and schedule or
+  dispatch events, or else `CRON_TOKEN`. in production `/metrics`
+  In production, `/metrics` needs `METRICS_TOKEN` or `ADMIN_TOKEN` unless `METRICS_PUBLIC=true`.
+  Static tokens are compared in constant time.
 - Client API keys are 256-bit random values, stored only as SHA-256 hashes, and shown once.
 - Signed webhooks use HMAC-SHA256 over the raw body (`X-Signature-256` / `X-Hub-Signature-256`).
   Pair them with `Idempotency-Key` (or GitHub's `X-GitHub-Delivery`) to reject replays.

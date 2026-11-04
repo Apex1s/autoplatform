@@ -45,6 +45,9 @@ class Settings:
     queue_prefix: str
     admin_token: str
     cron_token: str
+    cron_oidc_repository: str
+    cron_oidc_audience: str
+    cron_oidc_ref: str
     metrics_token: str
     metrics_public: bool
     max_body_bytes: int
@@ -101,6 +104,10 @@ def get_settings() -> Settings:
         queue_prefix=_env("QUEUE_PREFIX", "ap"),
         admin_token=_env("ADMIN_TOKEN"),
         cron_token=_env("CRON_TOKEN") or _env("ADMIN_TOKEN"),
+        # GitHub Actions OIDC (keyless): accept tokens minted for this repo/branch/audience
+        cron_oidc_repository=_env("CRON_OIDC_REPOSITORY"),
+        cron_oidc_audience=_env("CRON_OIDC_AUDIENCE", "autoplatform-cron"),
+        cron_oidc_ref=_env("CRON_OIDC_REF", "refs/heads/main"),
         metrics_token=_env("METRICS_TOKEN"),
         # production default: /metrics needs METRICS_TOKEN or ADMIN_TOKEN unless this is true
         metrics_public=_bool("METRICS_PUBLIC", False),

@@ -1,7 +1,7 @@
 # Render Blueprint: free Docker web service (no credit card needed).
 # Deploy: https://render.com/deploy?repo=<this repo's GitHub URL>
 # Free web services sleep after 15 min without inbound traffic; the GitHub Actions
-# keep-alive (repo variable KEEPALIVE=true) pings /livez every 10 min.
+# keep-alive pings /livez every 10 min (set repo variable KEEPALIVE=false on private repos).
 services:
   - type: web
     name: autoplatform
@@ -28,6 +28,9 @@ services:
       # Neon's free compute (100 CU-hours/month) scales to zero between runs (~30 CU-h idle)
       - key: WORKER_HEALTH_PERSIST_SECONDS
         value: "0"
+      # /cron/* accepts GitHub Actions OIDC tokens from this repo's main branch (keyless)
+      - key: CRON_OIDC_REPOSITORY
+        value: Apex1s/autoplatform
       - key: GROQ_MODEL
         value: qwen/qwen3.8-27b
       - key: GEMINI_MODEL

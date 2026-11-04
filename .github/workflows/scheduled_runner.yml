@@ -1,15 +1,18 @@
 # Autonomous scheduler for the deployed platform.
 #
-#  keepalive (every 10 min, only if repo variable KEEPALIVE == 'true'):
+#  keepalive (every 10 min; on by default, disable with repo variable KEEPALIVE=false):
 #      GET /livez so a free Render service never hits its 15-min idle spin-down.
-#      Public repos: Actions minutes are free. Private repos: leave KEEPALIVE unset
+#      Public repos: Actions minutes are free. PRIVATE repos must set KEEPALIVE=false
 #      (4,300 min/month would exceed the 2,000 free minutes).
 #  trigger (twice an hour, ~1,440 min/month):
 #      wake + GET /healthz, POST /cron/maintenance, POST /cron/provider_probe every 6h,
 #      optional queue drain inside Actions when the host is down (vars.RUN_DRAIN_FALLBACK).
 #
-# Repo variables: PLATFORM_URL (e.g. https://autoplatform.onrender.com), KEEPALIVE, RUN_DRAIN_FALLBACK
-# Repo secrets:   CRON_TOKEN  [+ DATABASE_URL, UPSTASH_REDIS_URL, GROQ_API_KEY, GEMINI_API_KEY for the drain fallback]
+# Auth: keyless. Each run mints a short-lived GitHub OIDC token (audience autoplatform-cron);
+# the app accepts it because CRON_OIDC_REPOSITORY pins this repo + main. No cron secret needed.
+# Optional repo variables: PLATFORM_URL (overrides the default below), KEEPALIVE, RUN_DRAIN_FALLBACK
+# Optional secrets: CRON_TOKEN (static fallback); DATABASE_URL, UPSTASH_REDIS_URL, GROQ_API_KEY,
+#                   GEMINI_API_KEY (only for the drain fallback)
 name: scheduled-runner
 
 on:
@@ -30,7 +33,7 @@ permissions:
 jobs:
   keepalive:
     if: >-
-      (github.event.schedule == '*/10 * * * *' && vars.KEEPALIVE == 'true') ||
+      (github.event.schedule == '*/10 * * * *' && vars.KEEPALIVE != 'false') ||
       (github.event_name == 'workflow_dispatch' && inputs.task == 'keepalive')
     runs-on: ubuntu-latest
     timeout-minutes: 4
@@ -38,12 +41,14 @@ jobs:
       group: keepalive
       cancel-in-progress: true
     env:
-      PLATFORM_URL: ${{ vars.PLATFORM_URL || secrets.PLATFORM_URL }}
+      PLATFORM_URL: ${{ vars.PLATFORM_URL || 'https://autoplatform.onrender.com' }}
     steps:
       - name: Ping /livez
         run: |
           if [ -z "$PLATFORM_URL" ]; then echo "::notice::PLATFORM_URL not set - skipping"; exit 0; fi
-          curl -fsS --retry 8 --retry-delay 10 --retry-all-errors --max-time 30 "$PLATFORM_URL/livez"
+          # a failed ping is logged, never fatal (no failure emails while the host is down/undeployed)
+          curl -fsS --retry 8 --retry-delay 10 --retry-all-errors --max-time 30 "$PLATFORM_URL/livez" \
+            || echo "::warning::keep-alive ping to $PLATFORM_URL failed"
 
   trigger:
     if: >-
@@ -56,20 +61,29 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: read
+      id-token: write  # mint the short-lived OIDC token the app verifies (no stored cron secret)
       actions: write   # only used to reset GitHub's 60-day inactivity timer for this workflow
     env:
-      PLATFORM_URL: ${{ vars.PLATFORM_URL || secrets.PLATFORM_URL }}
-      CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+      PLATFORM_URL: ${{ vars.PLATFORM_URL || 'https://autoplatform.onrender.com' }}
     steps:
-      - name: Check configuration
+      - name: Get cron credential (GitHub OIDC, falls back to CRON_TOKEN secret)
         id: cfg
+        env:
+          STATIC_TOKEN: ${{ secrets.CRON_TOKEN }}
         run: |
-          if [ -z "$PLATFORM_URL" ] || [ -z "$CRON_TOKEN" ]; then
-            echo "::notice::PLATFORM_URL / CRON_TOKEN not set yet - skipping."
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "configured=true" >> "$GITHUB_OUTPUT"
+          TOKEN=""
+          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            TOKEN=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=autoplatform-cron" | jq -r .value)
           fi
+          [ -z "$TOKEN" ] && TOKEN="$STATIC_TOKEN"
+          if [ -z "$TOKEN" ]; then
+            echo "::notice::no OIDC token and no CRON_TOKEN secret - skipping."
+            echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "CRON_AUTH=$TOKEN" >> "$GITHUB_ENV"
+          echo "configured=true" >> "$GITHUB_OUTPUT"
 
       - name: Wake host and check health
         id: health
@@ -91,7 +105,7 @@ jobs:
         run: |
           fire() {
             echo "firing $1"
-            curl -fsS --max-time 30 -X POST -H "Authorization: Bearer $CRON_TOKEN" "$PLATFORM_URL/cron/$1"
+            curl -fsS --max-time 30 -X POST -H "Authorization: Bearer $CRON_AUTH" "$PLATFORM_URL/cron/$1"
             echo
           }
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then

@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from app.config import Settings, get_settings
+from core import github_oidc
 from core.llm_router import LLMRouter
 from core.queue import TaskQueue
 from db import repo
@@ -115,12 +116,22 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
         if not hmac.compare_digest(_bearer(authorization), settings.admin_token):
             raise HTTPException(401, "invalid admin token")
 
-    def require_cron(authorization: str | None = Header(default=None)) -> None:
-        if not settings.cron_token:
-            raise HTTPException(503, "CRON_TOKEN/ADMIN_TOKEN not configured")
+    async def require_cron(authorization: str | None = Header(default=None)) -> None:
         token = _bearer(authorization)
-        if not (hmac.compare_digest(token, settings.cron_token)
-                or (settings.admin_token and hmac.compare_digest(token, settings.admin_token))):
+        if settings.cron_oidc_repository and github_oidc.looks_like_jwt(token):
+            try:
+                claims = await asyncio.to_thread(
+                    github_oidc.verify, token, repository=settings.cron_oidc_repository,
+                    audience=settings.cron_oidc_audience, ref=settings.cron_oidc_ref or None)
+            except github_oidc.OIDCError as e:
+                log.warning("rejected cron OIDC token: %s", e)
+                raise HTTPException(401, "invalid GitHub OIDC token") from None
+            log.info("cron call from %s run %s", claims.get("workflow_ref"), claims.get("run_id"))
+            return
+        if not settings.cron_token:
+            raise HTTPException(503, "no cron auth configured (CRON_TOKEN, ADMIN_TOKEN or CRON_OIDC_REPOSITORY)")
+        if not token or not (hmac.compare_digest(token, settings.cron_token)
+                             or (settings.admin_token and hmac.compare_digest(token, settings.admin_token))):
             raise HTTPException(401, "invalid cron token")
 
     async def require_client(x_api_key: str | None = Header(default=None)) -> Client:

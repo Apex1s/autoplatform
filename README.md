@@ -18,7 +18,7 @@ A zero-cost, always-on automation backend for multi-client work:
 - **Postgres** on the Neon free tier stores clients, jobs, execution logs, API usage and worker health.
 - **LLM router** sends requests to Groq or Gemini. On a 429 or a timeout it fails over to the other provider immediately, and it retries 5xx errors with exponential backoff. It also tracks token usage.
 - **Async worker** runs inside the web container, so one free instance does everything.
-- **GitHub Actions** pings the service to keep it awake, runs maintenance, probes the providers, and can drain the queue itself if the host is down.
+- **GitHub Actions** pings the service to keep it awake, runs maintenance, probes the providers, and can drain the queue itself if the host is down. It authenticates with keyless OIDC tokens, so no cron secret is stored in GitHub.
 
 None of these services needs a credit card.
 
@@ -51,7 +51,7 @@ None of these services needs a credit card.
 | POST | `/webhook` | `X-API-Key` | Enqueue a client job `{type, payload, max_attempts?, delay_seconds?}`; supports `Idempotency-Key` |
 | POST | `/webhook/{client_slug}` | `X-Signature-256: sha256=<hmac>` (or `X-Hub-Signature-256`) | Signed third-party webhooks (GitHub/Stripe style), queued as a `webhook.event` job |
 | GET | `/tasks/{job_id}`, `/tasks` | `X-API-Key` | Job status and result, scoped to the client |
-| POST | `/cron/{maintenance\|provider_probe}` | `Bearer CRON_TOKEN` | Scheduled system jobs |
+| POST | `/cron/{maintenance\|provider_probe}` | GitHub OIDC token, or `Bearer CRON_TOKEN` | Scheduled system jobs |
 | GET | `/cron/jobs/{job_id}` | `Bearer CRON_TOKEN` | Status of a system job |
 | POST/GET | `/admin/clients` | `Bearer ADMIN_TOKEN` | Create a client (returns `api_key` and `webhook_secret` once) or list clients |
 | DELETE | `/admin/clients/{slug}` | `Bearer ADMIN_TOKEN` | Deactivate a client (revokes its API key) |
@@ -95,7 +95,7 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 cp .env.example .env            # no keys needed: falls back to SQLite + in-memory Redis
 uvicorn app.main:app --port 7860
-python -m pytest -q             # 53 tests; the suite never reads .env (hermetic)
+python -m pytest -q             # 80 tests; the suite never reads .env (hermetic)
 TEST_DATABASE_URL=postgresql://... TEST_REDIS_URL=redis://... python -m pytest -q   # real backends
 python -m scripts.probe_providers   # checks each configured provider and writes probe_results.json
 ```
@@ -107,23 +107,20 @@ To rehearse failover against a provider that is down:
 ## Deploy on Render
 
 1. Sign up at https://render.com with GitHub. No card is needed.
-2. Open `https://render.com/deploy?repo=https://github.com/<you>/autoplatform`, paste the six secrets it asks for (`DATABASE_URL` with the Neon **-pooler** host, `UPSTASH_REDIS_URL`, `GROQ_API_KEY`, `GEMINI_API_KEY`, `ADMIN_TOKEN`, `CRON_TOKEN`), and click **Apply**.
-3. In the GitHub repo:
-   - Add a variable `PLATFORM_URL` set to `https://<service>.onrender.com`.
-   - Add a secret `CRON_TOKEN`.
-   - On a public repo, also add the variable `KEEPALIVE=true`.
+2. Open https://render.com/deploy?repo=https://github.com/Apex1s/autoplatform, paste the six secrets it asks for (`DATABASE_URL` with the Neon **-pooler** host, `UPSTASH_REDIS_URL`, `GROQ_API_KEY`, `GEMINI_API_KEY`, `ADMIN_TOKEN`, `CRON_TOKEN`), and click **Apply**.
+3. If Render gives the service a URL other than `https://autoplatform.onrender.com`, set the repo variable `PLATFORM_URL` to it, or change the default in `scheduled_runner.yml`.
 4. Verify:
    ```bash
-   python -m scripts.e2e_smoke --base-url https://<service>.onrender.com --admin-token "$ADMIN_TOKEN" --llm
+   python -m scripts.e2e_smoke --base-url https://autoplatform.onrender.com --admin-token "$ADMIN_TOKEN" --llm
    ```
 
 Render redeploys automatically on every push to `main`. Migrations run on boot.
 
 ## Scheduled runs: GitHub Actions
 
-`.github/workflows/scheduled_runner.yml`:
+`.github/workflows/scheduled_runner.yml` needs **no stored secrets**. Each run asks GitHub for a short-lived OIDC token (audience `autoplatform-cron`). The app checks GitHub's signature on it and only accepts tokens issued to `CRON_OIDC_REPOSITORY` on `refs/heads/main` from a `schedule` or `workflow_dispatch` event. An optional `CRON_TOKEN` secret is used if OIDC isn't available.
 
-- **keepalive** runs every 10 minutes when `KEEPALIVE=true` and calls `GET /livez`.
+- **keepalive** runs every 10 minutes and calls `GET /livez`. It is on by default; private repos should set the variable `KEEPALIVE=false`.
 - **trigger** runs at :17 and :47 past each hour:
   1. Calls `/healthz`, retrying for up to 5 minutes so a sleeping instance has time to start.
   2. Fires `/cron/maintenance`. This reaps workers whose Redis heartbeat expired, requeues their jobs and releases the ones left `running`. It also re-enqueues jobs that never reached Redis, saves worker health to Postgres, and prunes logs older than `LOG_RETENTION_DAYS`.
@@ -131,7 +128,7 @@ Render redeploys automatically on every push to `main`. Migrations run on boot.
   4. Resets GitHub's 60-day inactivity timer for scheduled workflows once a week.
   5. **Fallback:** if the host is down and `RUN_DRAIN_FALLBACK=true` is set, it runs `python -m workers.worker --drain` inside the Action.
 
-`ci.yml` runs the test suite on SQLite, then again on real Postgres 16 and Redis 7, then builds the Docker image.
+`ci.yml` runs the test suite on SQLite, then again on real Postgres 16 and Redis 7, then builds the Docker image. Dependabot opens weekly update PRs for pip packages, GitHub Actions and the Docker base image.
 
 ## Reliability notes
 
