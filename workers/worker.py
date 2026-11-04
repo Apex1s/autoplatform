@@ -118,10 +118,15 @@ class Worker:
             log.error("job task crashed", exc_info=task.exception())
 
     async def _heartbeat_loop(self) -> None:
+        from db.session import dispose_if_idle
+
         while not self._stop.is_set():
-            await asyncio.sleep(self.settings.heartbeat_interval)
+            await asyncio.sleep(min(self.settings.heartbeat_interval, 60))
             try:
-                await self._heartbeat()
+                if time.monotonic() - (self.last_heartbeat_ok or 0) >= self.settings.heartbeat_interval:
+                    await self._heartbeat()
+                if dispose_if_idle():
+                    log.info("closed idle DB connections (lets serverless Postgres scale to zero)")
             except Exception:
                 log.exception("heartbeat failed")
 

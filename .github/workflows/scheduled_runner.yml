@@ -10,7 +10,8 @@
 #
 # Auth: keyless. Each run mints a short-lived GitHub OIDC token (audience autoplatform-cron);
 # the app accepts it because CRON_OIDC_REPOSITORY pins this repo + main. No cron secret needed.
-# Optional repo variables: PLATFORM_URL (overrides the default below), KEEPALIVE, RUN_DRAIN_FALLBACK
+# PLATFORM_URL: the deployed base URL (default below; a repo variable overrides it).
+# Optional repo variables: PLATFORM_URL, KEEPALIVE, RUN_DRAIN_FALLBACK
 # Optional secrets: CRON_TOKEN (static fallback); DATABASE_URL, UPSTASH_REDIS_URL, GROQ_API_KEY,
 #                   GEMINI_API_KEY (only for the drain fallback)
 name: scheduled-runner
@@ -41,7 +42,7 @@ jobs:
       group: keepalive
       cancel-in-progress: true
     env:
-      PLATFORM_URL: ${{ vars.PLATFORM_URL || 'https://autoplatform.onrender.com' }}
+      PLATFORM_URL: ${{ vars.PLATFORM_URL || '' }}
     steps:
       - name: Ping /livez
         run: |
@@ -64,13 +65,17 @@ jobs:
       id-token: write  # mint the short-lived OIDC token the app verifies (no stored cron secret)
       actions: write   # only used to reset GitHub's 60-day inactivity timer for this workflow
     env:
-      PLATFORM_URL: ${{ vars.PLATFORM_URL || 'https://autoplatform.onrender.com' }}
+      PLATFORM_URL: ${{ vars.PLATFORM_URL || '' }}
     steps:
       - name: Get cron credential (GitHub OIDC, falls back to CRON_TOKEN secret)
         id: cfg
         env:
           STATIC_TOKEN: ${{ secrets.CRON_TOKEN }}
         run: |
+          if [ -z "$PLATFORM_URL" ]; then
+            echo "::notice::PLATFORM_URL not set yet - skipping."
+            echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
           TOKEN=""
           if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
             TOKEN=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \

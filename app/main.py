@@ -143,7 +143,13 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
         return c
 
     # -------------------------------------------------------------- helpers
+    def _base(request: Request | None) -> str:
+        if settings.public_base_url or request is None:
+            return settings.public_base_url
+        return str(request.base_url).rstrip("/")  # honours X-Forwarded-Proto/Host (--proxy-headers)
+
     async def _enqueue(type_: str, payload: dict, *, client_id: str | None, source: str,
+                       request: Request | None = None,
                        max_attempts: int | None = None, delay: float = 0,
                        idempotency_key: str | None = None) -> dict[str, Any]:
         q: TaskQueue = app.state.queue
@@ -158,14 +164,14 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
                                         attempt=0, duration_ms=0, client_id=client_id,
                                         error=f"duplicate of {existing} (Idempotency-Key)")
                 return {"job_id": existing, "status": "duplicate", "duplicate": True,
-                        "status_url": f"{settings.public_base_url}/tasks/{existing}"}
+                        "status_url": f"{_base(request)}/tasks/{existing}"}
         try:
             await q.enqueue(job.id, delay=delay)
         except Exception:
             # Row stays queued; system.maintenance re-enqueues it once Redis is back.
             log.exception("enqueue failed for %s; will be recovered by maintenance", job.id)
         return {"job_id": job.id, "status": "queued", "type": type_,
-                "status_url": f"{settings.public_base_url}/tasks/{job.id}"}
+                "status_url": f"{_base(request)}/tasks/{job.id}"}
 
     # --------------------------------------------------------------- routes
     @app.get("/")
@@ -255,11 +261,11 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
 
     # ---- client task API (X-API-Key)
     @app.post("/webhook", status_code=202)
-    async def webhook(task: TaskIn, client: Client = Depends(require_client),
+    async def webhook(task: TaskIn, request: Request, client: Client = Depends(require_client),
                       idempotency_key: str | None = Header(default=None)):
         if task.type not in HANDLERS or task.type.startswith(SYSTEM_PREFIX):
             raise HTTPException(422, f"unknown job type; allowed: {client_job_types()}")
-        return await _enqueue(task.type, task.payload, client_id=client.id, source="webhook",
+        return await _enqueue(task.type, task.payload, client_id=client.id, source="webhook", request=request,
                               max_attempts=task.max_attempts, delay=task.delay_seconds,
                               idempotency_key=idempotency_key)
 
@@ -298,17 +304,18 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
         except Exception:
             body = {"raw": raw.decode(errors="replace")[:10000]}
         payload = {"event": x_event_type or x_github_event, "body": body}
-        return await _enqueue("webhook.event", payload, client_id=client.id, source="signed_webhook",
+        return await _enqueue("webhook.event", payload, client_id=client.id, source="signed_webhook", request=request,
                               idempotency_key=idempotency_key or x_github_delivery)
 
     # ---- cron triggers (GitHub Actions)
     CRON_JOBS = {"maintenance": "system.maintenance", "provider_probe": "system.provider_probe"}
 
     @app.post("/cron/{name}", status_code=202, dependencies=[Depends(require_cron)])
-    async def cron(name: str):
+    async def cron(name: str, request: Request):
         if name not in CRON_JOBS:
             raise HTTPException(404, f"unknown cron job; allowed: {sorted(CRON_JOBS)}")
-        out = await _enqueue(CRON_JOBS[name], {}, client_id=None, source="cron", max_attempts=1)
+        out = await _enqueue(CRON_JOBS[name], {}, client_id=None, source="cron", max_attempts=1,
+                             request=request)
         try:
             out["queue"] = await app.state.queue.depth()
         except Exception:
@@ -324,14 +331,14 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
 
     # ---- admin
     @app.post("/admin/clients", status_code=201, dependencies=[Depends(require_admin)])
-    async def create_client(body: ClientIn):
+    async def create_client(body: ClientIn, request: Request):
         if await asyncio.to_thread(repo.client_by_slug, body.slug):
             raise HTTPException(409, "slug already exists")
         c, api_key = await asyncio.to_thread(repo.create_client, body.slug, body.name)
         return {"id": c.id, "slug": c.slug, "name": c.name,
                 "api_key": api_key, "webhook_secret": c.webhook_secret,
-                "webhook_url": f"{settings.public_base_url}/webhook",
-                "signed_webhook_url": f"{settings.public_base_url}/webhook/{c.slug}",
+                "webhook_url": f"{_base(request)}/webhook",
+                "signed_webhook_url": f"{_base(request)}/webhook/{c.slug}",
                 "note": "api_key is shown once; store it now."}
 
     @app.delete("/admin/clients/{slug}", dependencies=[Depends(require_admin)])

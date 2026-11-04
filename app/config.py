@@ -39,6 +39,7 @@ class Settings:
     public_base_url: str
     database_url: str
     database_pool: str
+    db_idle_dispose_seconds: int
     redis_url: str
     upstash_rest_url: str
     upstash_rest_token: str
@@ -84,7 +85,7 @@ def _public_base_url() -> str:
         return explicit.rstrip("/")
     if _env("SPACE_HOST"):  # Hugging Face Spaces
         return f"https://{_env('SPACE_HOST')}"
-    return "http://localhost:7860"
+    return ""  # unknown: the API derives it from each request (behind the host's TLS proxy)
 
 
 @lru_cache
@@ -96,6 +97,8 @@ def get_settings() -> Settings:
         database_url=_env("DATABASE_URL") or "sqlite:///./autoplatform.db",
         # auto: no persistent connections to Neon/Supabase so serverless Postgres can scale to zero
         database_pool=_env("DATABASE_POOL", "auto").lower(),
+        # serverless Postgres: close pooled connections after this long idle so compute can suspend
+        db_idle_dispose_seconds=_int("DB_IDLE_DISPOSE_SECONDS", 120),
         redis_url=_env("UPSTASH_REDIS_URL") or _env("REDIS_URL") or "memory://",
         # If both are set, the queue talks to Upstash over HTTPS instead of TCP (for hosts
         # that block outbound Redis ports, e.g. Hugging Face Spaces).

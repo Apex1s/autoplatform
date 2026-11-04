@@ -34,12 +34,18 @@ None of these services needs a credit card.
                                                LLM router: Groq ⇄ Gemini
 ```
 
-## Hosting choice (verified November 2026)
+## Hosting choice (checked November 2026)
 
-| Platform | Free? | Notes |
+| Platform | No-card free tier? | Notes |
 |---|---|---|
-| **Render** (used here) | ✅ Free web service with no payment method | Sleeps after 15 min without inbound traffic, so GitHub Actions pings `/livez` every 10 min. 750 free instance-hours a month. Only SMTP ports are blocked outbound. |
-| Hugging Face Spaces | ❌ for Docker | Docker and Gradio Spaces on compute now need a PRO plan. Spaces can also only make outbound requests on ports 80, 443 and 8080, which is why the app can reach Upstash over HTTPS (`UPSTASH_REDIS_REST_URL`). |
+| **Back4App Containers** (used here) | ✅ "no credit card required" | 0.25 CPU, 256 MB RAM (the app uses ~70 MB), 100 GB transfer, Docker from GitHub, USA region. GitHub Actions pings `/livez` every 10 min in case idle apps sleep. |
+| Render | ❌ asked for a card at sign-up | `render.yaml` is kept for anyone who has a card on file. |
+| Hugging Face Spaces | ❌ | Docker and Gradio Spaces on compute need PRO. Outbound traffic is limited to ports 80, 443 and 8080; the Upstash REST transport (`UPSTASH_REDIS_REST_URL`) exists for hosts like this. |
+| Koyeb / Fly.io / Railway | ❌ | Koyeb and Fly.io require a card; Railway offers a trial credit only. |
+| Vercel Hobby | ⚠️ | No card, but non-commercial use only and serverless (no resident worker). |
+| Cloudflare Workers Free | ⚠️ | No card, but a 10 ms CPU limit per request is too small for a FastAPI app. |
+
+GitHub Actions is used only as the scheduler. GitHub's terms don't allow hosted runners to serve as an application host.
 
 ## Endpoints
 
@@ -83,9 +89,9 @@ Default models are `qwen/qwen3.8-27b` on Groq and `gemini-flash-lite-latest` on 
 | Service | Free limit | What this app uses while idle |
 |---|---|---|
 | Upstash | 500K commands/month | About 2 commands per poll (`ZRANGE` plus a blocking `BLMOVE`), **regardless of concurrency**, plus a heartbeat `SET`. With `WORKER_POLL_TIMEOUT=40` and `HEARTBEAT_INTERVAL=120` that's about 150K a month. |
-| Neon | 100 CU-hours/month; compute scales to zero after 5 min | No idle connections (`DATABASE_POOL=auto` uses NullPool for Neon). Heartbeats go to Redis, and worker health reaches Postgres only during the twice-hourly maintenance run. The database wakes about 2 times an hour, which comes to roughly 30 CU-hours a month, plus real traffic. |
-| Render | 750 instance-hours/month | One service running 24/7 uses about 730–744 hours. |
-| GitHub Actions | Unlimited for public repos; 2,000 min/month for private | Maintenance runs twice an hour, about 1,440 min a month. The 10-minute keep-alive adds about 4,300 min a month, so it is off by default and only runs when the repo variable `KEEPALIVE=true` is set. Enable it only on a public repo. |
+| Neon | 100 CU-hours/month; compute scales to zero after 5 min | A small connection pool that is emptied after `DB_IDLE_DISPOSE_SECONDS` (120 s) idle, so bursts are fast but compute still suspends. Heartbeats go to Redis, and worker health reaches Postgres only during the twice-hourly maintenance run. The database wakes about 2 times an hour, which comes to roughly 30 CU-hours a month, plus real traffic. |
+| Back4App | 0.25 CPU / 256 MB / 100 GB transfer per month | About 70 MB of RAM. Traffic is mostly small JSON. |
+| GitHub Actions | Unlimited for public repos; 2,000 min/month for private | Maintenance runs twice an hour, about 1,440 min a month. The 10-minute keep-alive adds about 4,300 min a month. It is on by default; set `KEEPALIVE=false` on a private repo. |
 | Groq / Gemini | Per-model rate limits | 429 responses fail over automatically, and the rate-limited provider cools down. |
 
 ## Local development
@@ -95,7 +101,7 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 cp .env.example .env            # no keys needed: falls back to SQLite + in-memory Redis
 uvicorn app.main:app --port 7860
-python -m pytest -q             # 80 tests; the suite never reads .env (hermetic)
+python -m pytest -q             # 82 tests; the suite never reads .env (hermetic)
 TEST_DATABASE_URL=postgresql://... TEST_REDIS_URL=redis://... python -m pytest -q   # real backends
 python -m scripts.probe_providers   # checks each configured provider and writes probe_results.json
 ```
@@ -104,17 +110,20 @@ To rehearse failover against a provider that is down:
 `FAKE_GROQ_MODE=429 uvicorn scripts.dev_fake_llm:app --port 58001`, then start the app with
 `GROQ_BASE_URL=http://127.0.0.1:58001/groq`. Gemini can stay real.
 
-## Deploy on Render
+## Deploy on Back4App (free, no card)
 
-1. Sign up at https://render.com with GitHub. No card is needed.
-2. Open https://render.com/deploy?repo=https://github.com/Apex1s/autoplatform, paste the six secrets it asks for (`DATABASE_URL` with the Neon **-pooler** host, `UPSTASH_REDIS_URL`, `GROQ_API_KEY`, `GEMINI_API_KEY`, `ADMIN_TOKEN`, `CRON_TOKEN`), and click **Apply**.
-3. If Render gives the service a URL other than `https://autoplatform.onrender.com`, set the repo variable `PLATFORM_URL` to it, or change the default in `scheduled_runner.yml`.
-4. Verify:
+1. Sign up at https://www.back4app.com with GitHub or Google.
+2. Go to **Build new app → Web Deployment (Containers)**, connect GitHub, and choose `Apex1s/autoplatform` with branch `main` and root `./`.
+3. Under **Environment variables**, add the six secrets: `DATABASE_URL` (the Neon **-pooler** host), `UPSTASH_REDIS_URL`, `GROQ_API_KEY`, `GEMINI_API_KEY`, `ADMIN_TOKEN` and `CRON_TOKEN`. All other settings already have production defaults in the `Dockerfile`.
+4. Deploy, then set the default `PLATFORM_URL` in `scheduled_runner.yml` to the app URL (`https://<app>.b4a.run`). A repo variable `PLATFORM_URL` also works.
+5. Verify:
    ```bash
-   python -m scripts.e2e_smoke --base-url https://autoplatform.onrender.com --admin-token "$ADMIN_TOKEN" --llm
+   python -m scripts.e2e_smoke --base-url https://<app>.b4a.run --admin-token "$ADMIN_TOKEN" --llm
    ```
 
-Render redeploys automatically on every push to `main`. Migrations run on boot.
+Each push to `main` redeploys. Migrations run on boot.
+
+**Other Docker hosts** (Render via `render.yaml`, Hugging Face PRO, a VPS) use the same image and the same six variables. On hosts that only allow ports 80, 443 and 8080, also set `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
 
 ## Scheduled runs: GitHub Actions
 

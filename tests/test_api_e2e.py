@@ -226,3 +226,13 @@ def test_metrics_reports_live_workers(api):
     assert len(m["workers"]) == 1 and m["workers"][0]["status"] == "alive"
     assert m["workers_awaiting_reap"] == []
     assert "autoplatform_workers_alive 1" in api.get("/metrics").text
+
+
+def test_urls_derived_from_request_when_base_url_unset(settings, make_router):
+    from dataclasses import replace
+    app = create_app(replace(settings, public_base_url="", run_embedded_worker=False), router=make_router())
+    with TestClient(app, base_url="https://platform.example.b4a.run") as c:
+        creds = c.post("/admin/clients", json={"slug": "urls", "name": "U"}, headers=ADMIN).json()
+        assert creds["webhook_url"] == "https://platform.example.b4a.run/webhook"
+        r = c.post("/webhook", json={"type": "echo"}, headers={"X-API-Key": creds["api_key"]}).json()
+        assert r["status_url"] == f"https://platform.example.b4a.run/tasks/{r['job_id']}"

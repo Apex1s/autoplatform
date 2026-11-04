@@ -177,3 +177,25 @@ async def test_maintenance_snapshots_live_workers(settings, make_router, make_qu
     finally:
         await w.stop()
         await q.close()
+
+
+def test_idle_pool_is_disposed(settings, monkeypatch):
+    """Pooled connections are closed after DB_IDLE_DISPOSE_SECONDS idle (serverless Postgres)."""
+    import time as _time
+
+    from sqlalchemy import event, text
+
+    from db import session as dbs
+
+    engine = dbs.get_engine()
+    event.listen(engine, "checkout", dbs._touch)
+    monkeypatch.setattr(dbs, "_idle_dispose", 1)
+    with dbs.session_scope() as s:
+        s.execute(text("SELECT 1"))
+    assert engine.pool.checkedin() >= 1
+    assert dbs.dispose_if_idle() is False  # used just now
+    monkeypatch.setattr(dbs, "_last_checkout", _time.monotonic() - 5)
+    assert dbs.dispose_if_idle() is True
+    assert dbs.dispose_if_idle() is False  # nothing left to close
+    with dbs.session_scope() as s:  # pool transparently reconnects afterwards
+        assert s.execute(text("SELECT 1")).scalar() == 1
