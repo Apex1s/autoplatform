@@ -29,19 +29,30 @@ async def probe_llm(router: LLMRouter, name: str) -> dict:
         return {"status": "fail", "error": str(e)[:400]}
 
 
-async def probe_redis(url: str) -> dict:
-    if url.startswith("memory://"):
+async def probe_redis(settings) -> dict:
+    if settings.redis_url.startswith("memory://") and not settings.upstash_rest_url:
         return {"status": "missing", "hint": "set UPSTASH_REDIS_URL (rediss://default:...@...upstash.io:6379)"}
-    q = TaskQueue.from_url(url, "probe")
-    t = time.perf_counter()
-    try:
-        await q.r.set("probe:ping", "1", ex=30)
-        ok = await q.r.get("probe:ping") == "1"
-        return {"status": "ok" if ok else "fail", "latency_ms": int((time.perf_counter() - t) * 1000)}
-    except Exception as e:
-        return {"status": "fail", "error": f"{type(e).__name__}: {e}"[:400]}
-    finally:
-        await q.close()
+    from dataclasses import replace
+
+    out = {}
+    variants = []
+    if settings.upstash_rest_url and settings.upstash_rest_token:
+        variants.append(("rest", settings))
+    if not settings.redis_url.startswith("memory://"):
+        variants.append(("tcp", replace(settings, upstash_rest_url="", upstash_rest_token="")))
+    for name, s in variants:
+        q = TaskQueue.from_settings(s)
+        t = time.perf_counter()
+        try:
+            await q.r.set("probe:ping", "1", ex=30)
+            ok = await q.r.get("probe:ping") == "1"
+            out[name] = {"status": "ok" if ok else "fail", "latency_ms": int((time.perf_counter() - t) * 1000)}
+        except Exception as e:
+            out[name] = {"status": "fail", "error": f"{type(e).__name__}: {e}"[:300]}
+        finally:
+            await q.close()
+    best = "ok" if any(v["status"] == "ok" for v in out.values()) else "fail"
+    return {"status": best, **out}
 
 
 def probe_db(url: str) -> dict:
@@ -51,12 +62,33 @@ def probe_db(url: str) -> dict:
 
     from db.session import get_engine
     t = time.perf_counter()
+    tcp_error = ""
     try:
         with get_engine().connect() as c:
             version = c.execute(text("SELECT version()")).scalar()
         return {"status": "ok", "server": str(version)[:60], "latency_ms": int((time.perf_counter() - t) * 1000)}
     except Exception as e:
-        return {"status": "fail", "error": f"{type(e).__name__}: {e}"[:400]}
+        tcp_error = f"{type(e).__name__}: {e}"[:300]
+    if "neon.tech" in url:  # TCP blocked (sandbox / port-restricted host)? try Neon's HTTPS SQL API
+        return {**probe_neon_http(url), "tcp": {"status": "fail", "error": tcp_error}}
+    return {"status": "fail", "error": tcp_error}
+
+
+def probe_neon_http(url: str) -> dict:
+    import re
+
+    import httpx
+
+    host = re.search(r"@([^/:]+)", url).group(1)
+    t = time.perf_counter()
+    try:
+        r = httpx.post(f"https://{host}/sql", headers={"Neon-Connection-String": url},
+                       json={"query": "select version() as v", "params": []}, timeout=30)
+        r.raise_for_status()
+        return {"status": "ok", "via": "neon https /sql", "server": r.json()["rows"][0]["v"][:40],
+                "latency_ms": int((time.perf_counter() - t) * 1000)}
+    except Exception as e:
+        return {"status": "fail", "error": f"{type(e).__name__}: {e}"[:300]}
 
 
 async def main() -> int:
@@ -67,7 +99,7 @@ async def main() -> int:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "groq": await probe_llm(router, "groq"),
             "gemini": await probe_llm(router, "gemini"),
-            "upstash_redis": await probe_redis(s.redis_url),
+            "upstash_redis": await probe_redis(s),
             "postgres": await asyncio.to_thread(probe_db, s.database_url),
         }
     finally:

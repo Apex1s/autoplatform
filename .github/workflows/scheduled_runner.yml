@@ -1,46 +1,71 @@
-# Autonomous cron trigger. Every 30 min:
-#   1. wakes the host (HF Spaces / Render free tiers sleep when idle) and checks /healthz
-#   2. fires /cron/maintenance (recover dead workers + stuck jobs, prune old logs)
-#   3. every 6h also fires /cron/provider_probe (per-provider LLM health in /metrics)
-#   4. optional fallback: if the host is down, drain the queue right here in Actions
-#      (set repo variable RUN_DRAIN_FALLBACK=true and the DB/Redis/LLM secrets)
+# Autonomous scheduler for the deployed platform.
 #
-# Secrets: PLATFORM_URL, CRON_TOKEN  [+ DATABASE_URL, UPSTASH_REDIS_URL, GROQ_API_KEY, GEMINI_API_KEY for fallback]
-# 30-min cadence = ~1,440 billed min/month: fits the 2,000 free minutes of a private repo
-# (public repos are unmetered).
+#  keepalive (every 10 min, only if repo variable KEEPALIVE == 'true'):
+#      GET /livez so a free Render service never hits its 15-min idle spin-down.
+#      Public repos: Actions minutes are free. Private repos: leave KEEPALIVE unset
+#      (4,300 min/month would exceed the 2,000 free minutes).
+#  trigger (twice an hour, ~1,440 min/month):
+#      wake + GET /healthz, POST /cron/maintenance, POST /cron/provider_probe every 6h,
+#      optional queue drain inside Actions when the host is down (vars.RUN_DRAIN_FALLBACK).
+#
+# Repo variables: PLATFORM_URL (e.g. https://autoplatform.onrender.com), KEEPALIVE, RUN_DRAIN_FALLBACK
+# Repo secrets:   CRON_TOKEN  [+ DATABASE_URL, UPSTASH_REDIS_URL, GROQ_API_KEY, GEMINI_API_KEY for the drain fallback]
 name: scheduled-runner
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/10 * * * *"
+    - cron: "17,47 * * * *"
   workflow_dispatch:
     inputs:
       task:
-        description: "cron task to fire"
+        description: "what to run"
         type: choice
-        options: [maintenance, provider_probe]
+        options: [maintenance, provider_probe, keepalive]
         default: maintenance
-
-concurrency:
-  group: scheduled-runner
-  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
+  keepalive:
+    if: >-
+      (github.event.schedule == '*/10 * * * *' && vars.KEEPALIVE == 'true') ||
+      (github.event_name == 'workflow_dispatch' && inputs.task == 'keepalive')
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    concurrency:
+      group: keepalive
+      cancel-in-progress: true
+    env:
+      PLATFORM_URL: ${{ vars.PLATFORM_URL || secrets.PLATFORM_URL }}
+    steps:
+      - name: Ping /livez
+        run: |
+          if [ -z "$PLATFORM_URL" ]; then echo "::notice::PLATFORM_URL not set - skipping"; exit 0; fi
+          curl -fsS --retry 8 --retry-delay 10 --retry-all-errors --max-time 30 "$PLATFORM_URL/livez"
+
   trigger:
+    if: >-
+      github.event.schedule == '17,47 * * * *' ||
+      (github.event_name == 'workflow_dispatch' && inputs.task != 'keepalive')
     runs-on: ubuntu-latest
     timeout-minutes: 8
+    concurrency:
+      group: scheduled-trigger
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: write   # only used to reset GitHub's 60-day inactivity timer for this workflow
     env:
-      PLATFORM_URL: ${{ secrets.PLATFORM_URL }}
+      PLATFORM_URL: ${{ vars.PLATFORM_URL || secrets.PLATFORM_URL }}
       CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
     steps:
       - name: Check configuration
         id: cfg
         run: |
           if [ -z "$PLATFORM_URL" ] || [ -z "$CRON_TOKEN" ]; then
-            echo "::notice::PLATFORM_URL / CRON_TOKEN secrets not set yet - skipping."
+            echo "::notice::PLATFORM_URL / CRON_TOKEN not set yet - skipping."
             echo "configured=false" >> "$GITHUB_OUTPUT"
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
@@ -52,7 +77,7 @@ jobs:
         continue-on-error: true
         run: |
           for i in $(seq 1 20); do
-            code=$(curl -s -o health.json -w '%{http_code}' --max-time 20 "$PLATFORM_URL/healthz" || echo 000)
+            code=$(curl -s -o health.json -w '%{http_code}' --max-time 30 "$PLATFORM_URL/healthz" || echo 000)
             echo "attempt $i: HTTP $code"
             if [ "$code" = "200" ]; then cat health.json; echo; exit 0; fi
             sleep 15
@@ -73,8 +98,18 @@ jobs:
             fire "${{ inputs.task }}"
           else
             fire maintenance
-            # provider probe every 6 hours (first run of hours 0,6,12,18)
-            if [ $(( $(date -u +%H) % 6 )) -eq 0 ] && [ $(date -u +%M) -lt 30 ]; then fire provider_probe; fi
+            # provider probe every 6 hours (the :17 run of hours 0, 6, 12, 18 UTC)
+            if [ $(( 10#$(date -u +%H) % 6 )) -eq 0 ] && [ $(( 10#$(date -u +%M) )) -lt 47 ]; then fire provider_probe; fi
+          fi
+
+      - name: Keep this schedule enabled (GitHub disables idle schedules after 60 days)
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # once a week is plenty; the API call resets the inactivity timer
+          if [ "$(date -u +%u)" = "1" ] && [ "$(date -u +%H)" = "00" ] && [ $(( 10#$(date -u +%M) )) -lt 47 ]; then
+            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/scheduled_runner.yml/enable" && echo "schedule kept alive"
           fi
 
       - name: Set up Python (fallback drain)
@@ -94,6 +129,8 @@ jobs:
           UPSTASH_REDIS_URL: ${{ secrets.UPSTASH_REDIS_URL }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_MODEL: qwen/qwen3.8-27b
+          GEMINI_MODEL: gemini-flash-lite-latest
         run: |
           pip install -q -r requirements.txt
           python -m workers.worker --drain --max-seconds 240

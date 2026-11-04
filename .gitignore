@@ -12,3 +12,4 @@ htmlcov/
 logs/
 probe_results.json
 .DS_Store
+*.local.txt

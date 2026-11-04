@@ -94,19 +94,23 @@ async def webhook_event(ctx: JobContext, payload: dict) -> dict:
 @handler("system.maintenance")
 async def maintenance(ctx: JobContext, payload: dict) -> dict:
     s = ctx.settings
-    stale = timedelta(seconds=max(3 * s.heartbeat_interval, 180))
-    dead = await asyncio.to_thread(repo.dead_workers, stale)
-    requeued_from_dead = 0
-    for wid in dead:
-        requeued_from_dead += await ctx.queue.requeue_worker(wid)
+    reaped = await ctx.queue.reap_dead_workers()  # heartbeat expired -> requeue its reserved jobs
+    released = 0
+    if reaped:
+        await asyncio.to_thread(repo.mark_workers, list(reaped), "dead")
+        for wid, ids in reaped.items():
+            released += await asyncio.to_thread(repo.release_jobs, ids, f"recovered from dead worker {wid}")
     stuck = await asyncio.to_thread(repo.stuck_jobs, timedelta(minutes=10),
                                     timedelta(seconds=3 * s.job_timeout))
     for jid in stuck:
         await ctx.queue.enqueue(jid)  # duplicates are harmless: claim_job is atomic
     promoted = await ctx.queue.promote_due()
     pruned = await asyncio.to_thread(repo.prune, s.log_retention_days)
-    return {"dead_workers": dead, "requeued_from_dead": requeued_from_dead,
-            "requeued_stuck": len(stuck), "promoted": promoted, "pruned": pruned}
+    alive, _ = await ctx.queue.live_workers()
+    snapshot = await asyncio.to_thread(repo.snapshot_workers, alive)  # worker_health in Postgres
+    return {"dead_workers": sorted(reaped), "requeued_from_dead": sum(len(v) for v in reaped.values()),
+            "released_running": released, "requeued_stuck": len(stuck), "promoted": promoted,
+            "pruned": pruned, "workers_snapshotted": snapshot}
 
 
 @handler("system.provider_probe")

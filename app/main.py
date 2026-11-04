@@ -52,8 +52,7 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
             applied = await asyncio.to_thread(run_migrations)
             if applied:
                 log.info("migrations applied: %s", applied)
-        q = queue or TaskQueue.from_url(settings.redis_url, settings.queue_prefix,
-                                        settings.worker_poll_timeout)
+        q = queue or TaskQueue.from_settings(settings)
         r = router or LLMRouter.from_settings(
             settings, usage_hook=lambda rec: asyncio.to_thread(repo.record_usage, rec))
         app.state.queue, app.state.router, app.state.worker = q, r, None
@@ -167,17 +166,24 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
     async def metrics(format: str = "prometheus", authorization: str | None = Header(default=None)):
         if settings.metrics_token and not hmac.compare_digest(_bearer(authorization), settings.metrics_token):
             raise HTTPException(401, "invalid metrics token")
-        counts, usage, workers_ = await asyncio.gather(
+        counts, usage, history = await asyncio.gather(
             asyncio.to_thread(repo.job_counts), asyncio.to_thread(repo.usage_summary, 24),
             asyncio.to_thread(repo.workers))
         try:
             depth = await app.state.queue.depth()
+            alive, dead = await app.state.queue.live_workers()
         except Exception:
-            depth = {"pending": -1, "delayed": -1}
+            depth, alive, dead = {"pending": -1, "delayed": -1}, {}, []
+        now = time.time()
+        workers_ = [{"worker_id": wid, "status": "alive", "host": hb.get("host"),
+                     "jobs_processed": hb.get("processed", 0), "jobs_failed": hb.get("failed", 0),
+                     "inflight": hb.get("inflight", 0),
+                     "heartbeat_age_seconds": round(now - hb.get("ts", now), 1)}
+                    for wid, hb in alive.items()]
         router_stats = app.state.router.snapshot()
         data = {"uptime_seconds": int(time.time() - app.state.started), "jobs": counts,
                 "queue": depth, "llm_since_boot": router_stats, "llm_usage_24h": usage,
-                "workers": workers_}
+                "workers": workers_, "workers_awaiting_reap": dead, "worker_history": history}
         if format == "json":
             return data
         lines = [f"autoplatform_uptime_seconds {data['uptime_seconds']}"]
@@ -192,11 +198,13 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
             lbl = f'provider="{u["provider"]}",success="{str(u["success"]).lower()}"'
             lines.append(f"autoplatform_llm_calls_24h{{{lbl}}} {u['calls']}")
             lines.append(f"autoplatform_llm_tokens_24h{{{lbl}}} {u['prompt_tokens'] + u['completion_tokens']}")
+        lines.append(f"autoplatform_workers_alive {len(workers_)}")
         for w in workers_:
             lbl = f'worker_id="{w["worker_id"]}"'
-            lines.append(f"autoplatform_worker_up{{{lbl}}} {1 if w['status'] == 'alive' else 0}")
-            lines.append(f"autoplatform_worker_heartbeat_age_seconds{{{lbl}}} {w['age_seconds']}")
+            lines.append(f"autoplatform_worker_up{{{lbl}}} 1")
+            lines.append(f"autoplatform_worker_heartbeat_age_seconds{{{lbl}}} {w['heartbeat_age_seconds']}")
             lines.append(f"autoplatform_worker_jobs_processed{{{lbl}}} {w['jobs_processed']}")
+            lines.append(f"autoplatform_worker_jobs_failed{{{lbl}}} {w['jobs_failed']}")
         return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
     # ---- client task API (X-API-Key)
@@ -281,6 +289,12 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
                 "webhook_url": f"{settings.public_base_url}/webhook",
                 "signed_webhook_url": f"{settings.public_base_url}/webhook/{c.slug}",
                 "note": "api_key is shown once; store it now."}
+
+    @app.delete("/admin/clients/{slug}", dependencies=[Depends(require_admin)])
+    async def deactivate_client(slug: str):
+        if not await asyncio.to_thread(repo.deactivate_client, slug):
+            raise HTTPException(404, "client not found")
+        return {"slug": slug, "active": False}
 
     @app.get("/admin/clients", dependencies=[Depends(require_admin)])
     async def clients():

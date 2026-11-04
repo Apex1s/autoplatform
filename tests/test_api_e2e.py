@@ -210,3 +210,19 @@ def test_metrics_token(settings, make_router):
         assert c.get("/metrics").status_code == 401
         assert c.get("/metrics", headers={"Authorization": "Bearer m"}).status_code == 200
         assert c.get("/healthz").json()["checks"]["worker"] == "external"
+
+
+def test_deactivate_client(api, client_creds):
+    key = {"X-API-Key": client_creds["api_key"]}
+    assert api.post("/webhook", json={"type": "echo"}, headers=key).status_code == 202
+    assert api.delete("/admin/clients/acme").status_code == 401
+    assert api.delete("/admin/clients/acme", headers=ADMIN).json() == {"slug": "acme", "active": False}
+    assert api.post("/webhook", json={"type": "echo"}, headers=key).status_code == 401  # key revoked
+    assert api.delete("/admin/clients/acme", headers=ADMIN).status_code == 404
+
+
+def test_metrics_reports_live_workers(api):
+    m = api.get("/metrics?format=json").json()
+    assert len(m["workers"]) == 1 and m["workers"][0]["status"] == "alive"
+    assert m["workers_awaiting_reap"] == []
+    assert "autoplatform_workers_alive 1" in api.get("/metrics").text

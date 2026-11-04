@@ -13,59 +13,80 @@ short_description: 24/7 multi-client automation backend (FastAPI + queue + LLM f
 
 A zero-cost, always-on automation backend for multi-client work:
 
-- **FastAPI**: webhook ingestion, per-client task API, cron triggers, health and metrics
-- **Redis queue** (Upstash free tier): a reliable queue with crash recovery, delayed retries and idempotency keys
-- **Postgres** (Neon or Supabase free tier): stores clients, jobs, execution logs, API usage and worker health
-- **LLM router**: Groq ⇄ Gemini with instant failover on 429 or timeout, exponential backoff on 5xx, and token tracking
-- **Async workers**: run inside the web container (one free container does everything) or standalone
-- **GitHub Actions cron**: wakes the host, runs maintenance, probes providers, and can drain the queue itself if the host is down
+- **FastAPI** handles webhook ingestion, a per-client task API, cron triggers, health checks and metrics.
+- **Redis queue** on the Upstash free tier, over TCP/TLS or the HTTPS REST API. It recovers from crashes, retries delayed jobs and supports idempotency keys.
+- **Postgres** on the Neon free tier stores clients, jobs, execution logs, API usage and worker health.
+- **LLM router** sends requests to Groq or Gemini. On a 429 or a timeout it fails over to the other provider immediately, and it retries 5xx errors with exponential backoff. It also tracks token usage.
+- **Async worker** runs inside the web container, so one free instance does everything.
+- **GitHub Actions** pings the service to keep it awake, runs maintenance, probes the providers, and can drain the queue itself if the host is down.
 
-Every service used is on a free tier that needs **no credit card**.
+None of these services needs a credit card.
 
 ```
- client / 3rd-party ──► POST /webhook (X-API-Key)            ┌─────────────┐
-                    ──► POST /webhook/{slug} (HMAC-SHA256)   │  Postgres   │ jobs, clients,
- GitHub Actions ────► POST /cron/{name} (Bearer CRON_TOKEN)  │ (Neon/Supa) │ logs, usage, health
-                               │                             └──────▲──────┘
-                       FastAPI ─┴─► job row ──► Redis LPUSH          │
+ client / 3rd-party ──► POST /webhook (X-API-Key)            ┌──────────────┐
+                    ──► POST /webhook/{slug} (HMAC-SHA256)   │ Neon Postgres│ jobs, clients, logs,
+ GitHub Actions ────► POST /cron/{name} (Bearer CRON_TOKEN)  │              │ usage, worker health
+                               │                             └──────▲───────┘
+                       FastAPI ─┴─► job row ──► Upstash LPUSH        │
                                                   │                 │
-                          embedded worker ◄─ BLMOVE ─┘ ──► handler ──┤
+              dispatcher (1 blocking BLMOVE) ◄────┘ ──► N handlers ──┤
                                                             │       │
-                                               LLM router: groq ⇄ gemini
+                                               LLM router: Groq ⇄ Gemini
 ```
+
+## Hosting choice (verified November 2026)
+
+| Platform | Free? | Notes |
+|---|---|---|
+| **Render** (used here) | ✅ Free web service with no payment method | Sleeps after 15 min without inbound traffic, so GitHub Actions pings `/livez` every 10 min. 750 free instance-hours a month. Only SMTP ports are blocked outbound. |
+| Hugging Face Spaces | ❌ for Docker | Docker and Gradio Spaces on compute now need a PRO plan. Spaces can also only make outbound requests on ports 80, 443 and 8080, which is why the app can reach Upstash over HTTPS (`UPSTASH_REDIS_REST_URL`). |
 
 ## Endpoints
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| GET | `/healthz` | – | DB + Redis + worker heartbeat check (503 if DB/Redis is down) |
-| GET | `/livez` | – | Liveness only (used by the Docker HEALTHCHECK) |
+| GET | `/healthz` | – | Checks DB, Redis and the worker heartbeat; returns 503 if DB or Redis is down |
+| GET | `/livez` | – | Liveness only, with no DB or Redis access (for keep-alive pings and health checks) |
 | GET | `/metrics` | optional `METRICS_TOKEN` | Prometheus text; add `?format=json` for JSON |
 | POST | `/webhook` | `X-API-Key` | Enqueue a client job `{type, payload, max_attempts?, delay_seconds?}`; supports `Idempotency-Key` |
-| POST | `/webhook/{client_slug}` | `X-Signature-256: sha256=<hmac>` (or `X-Hub-Signature-256`) | Signed third-party webhooks (GitHub/Stripe style) → `webhook.event` job |
-| GET | `/tasks/{job_id}`, `/tasks` | `X-API-Key` | Job status and result (scoped to the client) |
+| POST | `/webhook/{client_slug}` | `X-Signature-256: sha256=<hmac>` (or `X-Hub-Signature-256`) | Signed third-party webhooks (GitHub/Stripe style), queued as a `webhook.event` job |
+| GET | `/tasks/{job_id}`, `/tasks` | `X-API-Key` | Job status and result, scoped to the client |
 | POST | `/cron/{maintenance\|provider_probe}` | `Bearer CRON_TOKEN` | Scheduled system jobs |
 | GET | `/cron/jobs/{job_id}` | `Bearer CRON_TOKEN` | Status of a system job |
 | POST/GET | `/admin/clients` | `Bearer ADMIN_TOKEN` | Create a client (returns `api_key` and `webhook_secret` once) or list clients |
+| DELETE | `/admin/clients/{slug}` | `Bearer ADMIN_TOKEN` | Deactivate a client (revokes its API key) |
 | GET | `/docs` | – | OpenAPI UI |
 
-**Job types:** `echo`, `llm.complete` (`{prompt | messages, system?, max_tokens?, temperature?}`),
-`http.fetch` (`{url, params?, summarize?}`: public HTTPS APIs only, e.g. from
-[public-apis](https://github.com/public-apis/public-apis); private and internal addresses are blocked), and `webhook.event`.
+**Job types:**
+- `echo`
+- `llm.complete`: `{prompt | messages, system?, max_tokens?, temperature?}`
+- `http.fetch`: `{url, params?, summarize?}`. Public HTTPS APIs only, e.g. from [public-apis](https://github.com/public-apis/public-apis); private and internal addresses are blocked.
+- `webhook.event`
+
 To add a job type, register a new function with `@handler("name")` in `workers/handlers.py`.
 
 ## Failover policy (`core/llm_router.py`)
 
 | Provider response | Action |
 |---|---|
-| 429 | Fail over to the next provider **immediately**. The 429'd provider is skipped for `Retry-After` seconds (also read from Gemini's `retryDelay`; default `LLM_DEFAULT_COOLDOWN`) |
+| 429 | Fail over to the next provider **immediately**. The rate-limited provider is skipped for `Retry-After` seconds (also read from Gemini's `retryDelay`; default `LLM_DEFAULT_COOLDOWN`) |
 | timeout / 408 / 504 | Fail over immediately |
 | 5xx, network error, malformed body | Retry the same provider with jittered exponential backoff (`LLM_MAX_RETRIES`), then fail over |
-| other 4xx (bad key, etc.) | Fail over immediately, no retry |
+| other 4xx (bad key, unknown model) | Fail over immediately, no retry |
 | every provider failed | Back off and run another pass (`LLM_MAX_ROUNDS`). If that also fails, the job is retried later with job-level backoff |
 
 Every attempt is written to `api_usage` (provider, model, tokens, latency, status, error kind).
-`/metrics` exposes per-provider counters since boot plus 24h totals from the database.
+Default models are `qwen/qwen3.8-27b` on Groq and `gemini-flash-lite-latest` on Gemini. Groq's `gpt-oss` models and the larger Gemini "thinking" models spend tokens on reasoning before they answer, so they are worse for small `max_tokens` budgets.
+
+## Free-tier budget
+
+| Service | Free limit | What this app uses while idle |
+|---|---|---|
+| Upstash | 500K commands/month | About 2 commands per poll (`ZRANGE` plus a blocking `BLMOVE`), **regardless of concurrency**, plus a heartbeat `SET`. With `WORKER_POLL_TIMEOUT=40` and `HEARTBEAT_INTERVAL=120` that's about 150K a month. |
+| Neon | 100 CU-hours/month; compute scales to zero after 5 min | No idle connections (`DATABASE_POOL=auto` uses NullPool for Neon). Heartbeats go to Redis, and worker health reaches Postgres only during the twice-hourly maintenance run. The database wakes about 2 times an hour, which comes to roughly 30 CU-hours a month, plus real traffic. |
+| Render | 750 instance-hours/month | One service running 24/7 uses about 730–744 hours. |
+| GitHub Actions | Unlimited for public repos; 2,000 min/month for private | Maintenance runs twice an hour, about 1,440 min a month. The 10-minute keep-alive adds about 4,300 min a month, so it is off by default and only runs when the repo variable `KEEPALIVE=true` is set. Enable it only on a public repo. |
+| Groq / Gemini | Per-model rate limits | 429 responses fail over automatically, and the rate-limited provider cools down. |
 
 ## Local development
 
@@ -74,64 +95,48 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 cp .env.example .env            # no keys needed: falls back to SQLite + in-memory Redis
 uvicorn app.main:app --port 7860
-python -m pytest -q             # 34 tests
-# same suite against real backends:
-TEST_DATABASE_URL=postgresql://... TEST_REDIS_URL=redis://... python -m pytest -q
+python -m pytest -q             # 53 tests; the suite never reads .env (hermetic)
+TEST_DATABASE_URL=postgresql://... TEST_REDIS_URL=redis://... python -m pytest -q   # real backends
 python -m scripts.probe_providers   # checks each configured provider and writes probe_results.json
 ```
 
-To rehearse failover without real keys:
-`FAKE_GROQ_MODE=429 uvicorn scripts.dev_fake_llm:app --port 58001`, then run the app with
-`GROQ_BASE_URL=http://127.0.0.1:58001/groq GEMINI_BASE_URL=http://127.0.0.1:58001/gemini GROQ_API_KEY=x GEMINI_API_KEY=x`.
+To rehearse failover against a provider that is down:
+`FAKE_GROQ_MODE=429 uvicorn scripts.dev_fake_llm:app --port 58001`, then start the app with
+`GROQ_BASE_URL=http://127.0.0.1:58001/groq`. Gemini can stay real.
 
-## Free accounts to create (none ask for a card)
+## Deploy on Render
 
-| Service | Where | Value to copy |
-|---|---|---|
-| Groq | https://console.groq.com/keys | `GROQ_API_KEY` |
-| Google AI Studio | https://aistudio.google.com/apikey | `GEMINI_API_KEY` |
-| Upstash Redis | https://console.upstash.com → Create database → **TCP** tab | `UPSTASH_REDIS_URL` (`rediss://default:…@….upstash.io:6379`) |
-| Neon Postgres | https://console.neon.tech → Connection string | `DATABASE_URL` (`…?sslmode=require`) |
-| Hugging Face | https://huggingface.co/new-space → SDK **Docker** (blank) | the Space hosts the app |
-
-Generate the tokens with `python -c "import secrets;print(secrets.token_urlsafe(32))"` and set them as `ADMIN_TOKEN` and `CRON_TOKEN`.
-
-## Deploy: Hugging Face Spaces (primary)
-
-1. Create a **Docker** Space (CPU basic, free). The YAML header at the top of this README configures it (`sdk: docker`, `app_port: 7860`).
-2. In the Space's **Settings → Variables and secrets**, add the secrets `GROQ_API_KEY`, `GEMINI_API_KEY`, `DATABASE_URL`,
-   `UPSTASH_REDIS_URL`, `ADMIN_TOKEN` and `CRON_TOKEN`, plus the variable `PUBLIC_BASE_URL=https://<user>-<space>.hf.space`.
-3. Push this repo to the Space:
+1. Sign up at https://render.com with GitHub. No card is needed.
+2. Open `https://render.com/deploy?repo=https://github.com/<you>/autoplatform`, paste the six secrets it asks for (`DATABASE_URL` with the Neon **-pooler** host, `UPSTASH_REDIS_URL`, `GROQ_API_KEY`, `GEMINI_API_KEY`, `ADMIN_TOKEN`, `CRON_TOKEN`), and click **Apply**.
+3. In the GitHub repo:
+   - Add a variable `PLATFORM_URL` set to `https://<service>.onrender.com`.
+   - Add a secret `CRON_TOKEN`.
+   - On a public repo, also add the variable `KEEPALIVE=true`.
+4. Verify:
    ```bash
-   git remote add space https://huggingface.co/spaces/<user>/<space>
-   git push space main          # use an HF access token with write scope as the password
-   ```
-4. Verify it:
-   ```bash
-   python -m scripts.e2e_smoke --base-url https://<user>-<space>.hf.space --admin-token "$ADMIN_TOKEN" --llm
+   python -m scripts.e2e_smoke --base-url https://<service>.onrender.com --admin-token "$ADMIN_TOKEN" --llm
    ```
 
-Free Spaces go to sleep after about 48h without traffic. The GitHub Actions cron calls the Space every 30 minutes, which keeps it awake.
+Render redeploys automatically on every push to `main`. Migrations run on boot.
 
-**Alternative: Render.** `render.yaml` is a ready Blueprint (free plan, Docker). If Render asks for a credit card, stop and use HF Spaces instead.
+## Scheduled runs: GitHub Actions
 
-## 24/7 cron: GitHub Actions
+`.github/workflows/scheduled_runner.yml`:
 
-`.github/workflows/scheduled_runner.yml` runs every 30 minutes. On each run it:
-1. Calls `/healthz`, retrying for up to 5 minutes so a sleeping host has time to start.
-2. Fires `/cron/maintenance`. This marks workers whose heartbeat has stopped as dead and moves their reserved jobs back to the queue, re-enqueues jobs that never reached Redis, re-runs jobs left `running` by a crash, and prunes logs older than `LOG_RETENTION_DAYS`.
-3. Every 6 hours, also fires `/cron/provider_probe`.
-4. **Fallback:** if the host is unhealthy and the repo variable `RUN_DRAIN_FALLBACK=true` is set, it installs the app and runs `python -m workers.worker --drain` inside the Action, so queued work still gets done.
-
-In the repo's **Settings → Secrets and variables → Actions**, set `PLATFORM_URL` and `CRON_TOKEN`. The fallback also needs `DATABASE_URL`, `UPSTASH_REDIS_URL`, `GROQ_API_KEY` and `GEMINI_API_KEY`.
-A 30-minute cadence uses about 1,440 minutes a month, which fits the 2,000 free minutes a private repo gets. Public repos have no minute limit.
+- **keepalive** runs every 10 minutes when `KEEPALIVE=true` and calls `GET /livez`.
+- **trigger** runs at :17 and :47 past each hour:
+  1. Calls `/healthz`, retrying for up to 5 minutes so a sleeping instance has time to start.
+  2. Fires `/cron/maintenance`. This reaps workers whose Redis heartbeat expired, requeues their jobs and releases the ones left `running`. It also re-enqueues jobs that never reached Redis, saves worker health to Postgres, and prunes logs older than `LOG_RETENTION_DAYS`.
+  3. Every 6 hours, also fires `/cron/provider_probe`.
+  4. Resets GitHub's 60-day inactivity timer for scheduled workflows once a week.
+  5. **Fallback:** if the host is down and `RUN_DRAIN_FALLBACK=true` is set, it runs `python -m workers.worker --drain` inside the Action.
 
 `ci.yml` runs the test suite on SQLite, then again on real Postgres 16 and Redis 7, then builds the Docker image.
 
 ## Reliability notes
 
-- Postgres is the source of truth for job state; Redis carries only job IDs. Claiming a job is a single atomic `UPDATE … WHERE status IN (queued, retrying)`, so a job ID that is enqueued twice still runs once.
-- Each worker reserves jobs into its own processing list (`BLMOVE`). On graceful shutdown, in-flight jobs go straight back to the queue. If a worker crashes, its heartbeat goes stale and maintenance recovers its jobs.
-- Upstash free tier has a monthly command quota. Idle cost is about one blocking pop per `WORKER_POLL_TIMEOUT` per loop, plus a few commands per job. Heartbeats go to Postgres, not Redis. If a backend returns from the blocking pop without waiting, the worker sleeps instead of spinning.
-- Neon and Supabase suspend idle compute, so the connection pool uses `pool_pre_ping` and recycles connections after 300s.
-- Migrations (`db/migrate.py`) are versioned and serialized with a Postgres advisory lock. They run automatically on every boot.
+- Postgres is the source of truth for job state; Redis carries only job IDs. Claiming a job is one atomic `UPDATE … WHERE status IN (queued, retrying)`, so a job ID that is enqueued twice still runs once. Delivery is at least once, so handlers should be idempotent.
+- A single dispatcher reserves jobs into this worker's processing list (`BLMOVE`) and runs up to `WORKER_CONCURRENCY` of them at a time. It wakes early when a delayed retry becomes due. On graceful shutdown, in-flight jobs go straight back to pending.
+- If a worker crashes, its Redis heartbeat expires (after 3 × `HEARTBEAT_INTERVAL` + 30s). Maintenance then requeues its reserved jobs and releases the ones it was running.
+- If a backend returns from the blocking pop without waiting, the worker sleeps instead of spinning.
+- Migrations (`db/migrate.py`) are versioned and serialized with a Postgres advisory lock. They run on every boot.

@@ -7,6 +7,7 @@ from typing import Iterator
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from app.config import get_settings
 
@@ -29,11 +30,16 @@ def get_engine() -> Engine:
         if url.startswith("sqlite"):
             _engine = create_engine(url, connect_args={"check_same_thread": False})
         else:
-            # Neon/Supabase free tiers suspend idle compute and drop idle connections:
-            # pre-ping + short recycle keeps the pool healthy.
-            _engine = create_engine(
-                url, pool_pre_ping=True, pool_recycle=300, pool_size=5, max_overflow=5
-            )
+            mode = get_settings().database_pool
+            serverless = any(h in url for h in ("neon.tech", "supabase.co", "supabase.com"))
+            if mode == "null" or (mode == "auto" and serverless):
+                # Hold no idle connections: Neon's free tier bills compute while connections
+                # keep it awake (100 CU-hours/month); NullPool lets it scale to zero.
+                _engine = create_engine(url, poolclass=NullPool)
+            else:
+                _engine = create_engine(
+                    url, pool_pre_ping=True, pool_recycle=300, pool_size=5, max_overflow=5
+                )
         _factory = sessionmaker(bind=_engine, expire_on_commit=False)
     return _engine
 

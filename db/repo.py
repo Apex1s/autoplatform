@@ -56,6 +56,12 @@ def list_clients() -> list[dict[str, Any]]:
                 for c in s.scalars(select(Client).order_by(Client.created_at))]
 
 
+def deactivate_client(slug: str) -> bool:
+    with session_scope() as s:
+        return s.execute(update(Client).where(Client.slug == slug, Client.active.is_(True))
+                         .values(active=False)).rowcount == 1
+
+
 # -------------------------------------------------------------------- jobs
 def create_job(type_: str, payload: dict, *, client_id: str | None, max_attempts: int,
                source: str, delay: float = 0) -> Job:
@@ -181,14 +187,38 @@ def heartbeat(worker_id: str, *, processed: int, failed: int, status: str = "ali
         w.last_heartbeat = utcnow()
 
 
-def dead_workers(stale_after: timedelta) -> list[str]:
+def snapshot_workers(alive: dict[str, dict]) -> int:
+    """Persist live heartbeats (read from Redis) in one DB round trip, during maintenance."""
+    from datetime import datetime, timezone
+
     with session_scope() as s:
-        ids = s.scalars(select(WorkerHealth.worker_id).where(
-            WorkerHealth.status.in_(["alive", "stopped"]),
-            WorkerHealth.last_heartbeat < utcnow() - stale_after)).all()
-        if ids:
-            s.execute(update(WorkerHealth).where(WorkerHealth.worker_id.in_(ids)).values(status="dead"))
-    return list(ids)
+        for wid, hb in alive.items():
+            w = s.get(WorkerHealth, wid)
+            if w is None:
+                w = WorkerHealth(worker_id=wid, hostname=str(hb.get("host") or "?"))
+                s.add(w)
+            w.status = "alive"
+            w.jobs_processed = int(hb.get("processed", 0))
+            w.jobs_failed = int(hb.get("failed", 0))
+            if hb.get("ts"):
+                w.last_heartbeat = datetime.fromtimestamp(float(hb["ts"]), tz=timezone.utc)
+    return len(alive)
+
+
+def mark_workers(worker_ids: list[str], status: str) -> None:
+    if not worker_ids:
+        return
+    with session_scope() as s:
+        s.execute(update(WorkerHealth).where(WorkerHealth.worker_id.in_(worker_ids)).values(status=status))
+
+
+def release_jobs(job_ids: list[str], reason: str) -> int:
+    """Running jobs whose worker died go back to claimable (at-least-once delivery)."""
+    if not job_ids:
+        return 0
+    with session_scope() as s:
+        return s.execute(update(Job).where(Job.id.in_(job_ids), Job.status == JobStatus.RUNNING)
+                         .values(status=JobStatus.RETRYING, error=reason)).rowcount
 
 
 def workers(limit: int = 20) -> list[dict[str, Any]]:

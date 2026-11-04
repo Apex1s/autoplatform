@@ -1,20 +1,38 @@
-# Render Blueprint (alternative host). Free web services spin down after ~15 min idle;
-# the GitHub Actions cron wakes it. If Render asks for a credit card, don't continue:
-# use Hugging Face Spaces (see README).
+# Render Blueprint: free Docker web service (no credit card needed).
+# Deploy: https://render.com/deploy?repo=<this repo's GitHub URL>
+# Free web services sleep after 15 min without inbound traffic; the GitHub Actions
+# keep-alive (repo variable KEEPALIVE=true) pings /livez every 10 min.
 services:
   - type: web
     name: autoplatform
     runtime: docker
     plan: free
+    region: frankfurt          # same region as the Neon database (eu-central-1)
     healthCheckPath: /livez
     autoDeploy: true
     envVars:
       - key: APP_ENV
         value: production
+      - key: PORT
+        value: "10000"
       - key: RUN_EMBEDDED_WORKER
         value: "true"
-      - key: PUBLIC_BASE_URL
-        sync: false
+      - key: WORKER_CONCURRENCY
+        value: "2"
+      # ~2 Redis commands per poll when idle: 40s => ~130K/month (Upstash free: 500K)
+      - key: WORKER_POLL_TIMEOUT
+        value: "40"
+      - key: HEARTBEAT_INTERVAL
+        value: "120"
+      # 0 = worker health reaches Postgres only via the twice-hourly maintenance job, so
+      # Neon's free compute (100 CU-hours/month) scales to zero between runs (~30 CU-h idle)
+      - key: WORKER_HEALTH_PERSIST_SECONDS
+        value: "0"
+      - key: GROQ_MODEL
+        value: qwen/qwen3.8-27b
+      - key: GEMINI_MODEL
+        value: gemini-flash-lite-latest
+      # ---- secrets: Render asks for these when you apply the Blueprint
       - key: DATABASE_URL
         sync: false
       - key: UPSTASH_REDIS_URL
@@ -24,6 +42,6 @@ services:
       - key: GEMINI_API_KEY
         sync: false
       - key: ADMIN_TOKEN
-        generateValue: true
+        sync: false
       - key: CRON_TOKEN
-        generateValue: true
+        sync: false

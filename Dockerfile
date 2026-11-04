@@ -1,4 +1,4 @@
-# Runs on Hugging Face Spaces (Docker SDK, port 7860, uid 1000) and Render (free, $PORT).
+# Runs on Render (free Docker web service, $PORT) and Hugging Face Spaces (Docker SDK; needs PRO).
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

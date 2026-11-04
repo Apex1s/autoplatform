@@ -7,7 +7,10 @@ from functools import lru_cache
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Tests set AUTOPLATFORM_SKIP_DOTENV=1 so a developer's real .env (live credentials)
+# can never leak into the test suite.
+if os.getenv("AUTOPLATFORM_SKIP_DOTENV") != "1":
+    load_dotenv()
 
 
 def _env(name: str, default: str = "") -> str:
@@ -35,7 +38,10 @@ class Settings:
     log_level: str
     public_base_url: str
     database_url: str
+    database_pool: str
     redis_url: str
+    upstash_rest_url: str
+    upstash_rest_token: str
     queue_prefix: str
     admin_token: str
     cron_token: str
@@ -60,10 +66,20 @@ class Settings:
     worker_concurrency: int
     worker_poll_timeout: int
     heartbeat_interval: int
+    health_persist_interval: int
     job_timeout: float
     job_max_attempts: int
     job_retry_base: float
     log_retention_days: int
+
+
+def _public_base_url() -> str:
+    explicit = _env("PUBLIC_BASE_URL") or _env("RENDER_EXTERNAL_URL")  # Render injects the latter
+    if explicit:
+        return explicit.rstrip("/")
+    if _env("SPACE_HOST"):  # Hugging Face Spaces
+        return f"https://{_env('SPACE_HOST')}"
+    return "http://localhost:7860"
 
 
 @lru_cache
@@ -71,16 +87,22 @@ def get_settings() -> Settings:
     return Settings(
         app_env=_env("APP_ENV", "development"),
         log_level=_env("LOG_LEVEL", "INFO"),
-        public_base_url=_env("PUBLIC_BASE_URL", "http://localhost:7860").rstrip("/"),
+        public_base_url=_public_base_url(),
         database_url=_env("DATABASE_URL") or "sqlite:///./autoplatform.db",
+        # auto: no persistent connections to Neon/Supabase so serverless Postgres can scale to zero
+        database_pool=_env("DATABASE_POOL", "auto").lower(),
         redis_url=_env("UPSTASH_REDIS_URL") or _env("REDIS_URL") or "memory://",
+        # If both are set, the queue talks to Upstash over HTTPS instead of TCP (for hosts
+        # that block outbound Redis ports, e.g. Hugging Face Spaces).
+        upstash_rest_url=_env("UPSTASH_REDIS_REST_URL"),
+        upstash_rest_token=_env("UPSTASH_REDIS_REST_TOKEN"),
         queue_prefix=_env("QUEUE_PREFIX", "ap"),
         admin_token=_env("ADMIN_TOKEN"),
         cron_token=_env("CRON_TOKEN") or _env("ADMIN_TOKEN"),
         metrics_token=_env("METRICS_TOKEN"),
         auto_migrate=_bool("AUTO_MIGRATE", True),
         groq_api_key=_env("GROQ_API_KEY"),
-        groq_model=_env("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        groq_model=_env("GROQ_MODEL", "qwen/qwen3.8-27b"),
         groq_base_url=_env("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
         gemini_api_key=_env("GEMINI_API_KEY"),
         gemini_model=_env("GEMINI_MODEL", "gemini-flash-lite-latest"),
@@ -99,7 +121,9 @@ def get_settings() -> Settings:
         run_embedded_worker=_bool("RUN_EMBEDDED_WORKER", True),
         worker_concurrency=_int("WORKER_CONCURRENCY", 2),
         worker_poll_timeout=_int("WORKER_POLL_TIMEOUT", 30),
-        heartbeat_interval=_int("HEARTBEAT_INTERVAL", 60),
+        heartbeat_interval=_int("HEARTBEAT_INTERVAL", 60),  # Redis heartbeat (cheap)
+        # Postgres snapshot of worker health; rare so Neon's free compute can scale to zero
+        health_persist_interval=_int("WORKER_HEALTH_PERSIST_SECONDS", 1800),
         job_timeout=_float("JOB_TIMEOUT_SECONDS", 120.0),
         job_max_attempts=_int("JOB_MAX_ATTEMPTS", 3),
         job_retry_base=_float("JOB_RETRY_BASE_SECONDS", 5.0),

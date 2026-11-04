@@ -13,6 +13,11 @@ from dataclasses import replace
 import httpx
 import pytest
 
+os.environ["AUTOPLATFORM_SKIP_DOTENV"] = "1"  # never load the developer's real .env
+for _var in ("GROQ_API_KEY", "GEMINI_API_KEY", "UPSTASH_REDIS_URL", "UPSTASH_REDIS_REST_URL",
+             "UPSTASH_REDIS_REST_TOKEN", "REDIS_URL", "DATABASE_URL", "METRICS_TOKEN",
+             "PUBLIC_BASE_URL", "RENDER_EXTERNAL_URL", "SPACE_HOST", "GROQ_BASE_URL", "GEMINI_BASE_URL"):
+    os.environ.pop(_var, None)
 os.environ.setdefault("ADMIN_TOKEN", "test-admin")
 os.environ.setdefault("CRON_TOKEN", "test-cron")
 
@@ -113,3 +118,67 @@ def settings(tmp_path, monkeypatch):
         r.close()
     reset_engine()
     get_settings.cache_clear()
+
+
+# ------------------------------------------------------------ queue backends
+class UpstashRestBridge:
+    """httpx transport that speaks Upstash's REST protocol on top of a fakeredis server."""
+
+    def __init__(self):
+        import fakeredis
+
+        self.redis = fakeredis.FakeRedis(decode_responses=True)
+        self.commands: list[list[str]] = []
+        self.fail_with: tuple[int, dict] | None = None
+
+    async def handler(self, request: httpx.Request) -> httpx.Response:
+        import asyncio
+
+        assert request.headers["authorization"] == "Bearer test-token"
+        if self.fail_with:
+            status, body = self.fail_with
+            return httpx.Response(status, json=body)
+        cmd = json.loads(request.content)
+        assert all(isinstance(a, str) for a in cmd), cmd  # Upstash gets strings only
+        self.commands.append(cmd)
+        try:
+            result = await asyncio.to_thread(self.redis.execute_command, *cmd)
+        except Exception as e:  # mimic Upstash error envelope
+            return httpx.Response(400, json={"error": f"ERR {e}"})
+        name = cmd[0].upper()
+        if name == "PING":
+            result = "PONG"
+        elif name == "SET":
+            result = "OK" if result else None
+        elif name == "ZRANGE" and "WITHSCORES" in [c.upper() for c in cmd]:
+            result = [str(x) for pair in result for x in pair]  # Upstash returns a flat list
+        elif isinstance(result, (set, tuple)):
+            result = list(result)
+        return httpx.Response(200, json={"result": result})
+
+
+@pytest.fixture
+def rest_bridge():
+    return UpstashRestBridge()
+
+
+@pytest.fixture(params=["fake", "rest"] if not REAL_REDIS else ["tcp"])
+def make_queue(request, settings, rest_bridge):
+    """Builds TaskQueues on each transport: fakeredis, Upstash REST (bridged), or real Redis."""
+    from core.queue import TaskQueue
+    from core.upstash_rest import UpstashRestRedis
+
+    made = []
+
+    def _make():
+        if request.param == "rest":
+            client = UpstashRestRedis("https://fake-db.upstash.io", "test-token",
+                                      transport=httpx.MockTransport(rest_bridge.handler))
+            q = TaskQueue(client, settings.queue_prefix, "rest")
+        else:
+            q = TaskQueue.from_settings(settings)
+        made.append(q)
+        return q
+
+    _make.backend = request.param
+    return _make
