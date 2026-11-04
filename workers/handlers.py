@@ -121,3 +121,57 @@ async def provider_probe(ctx: JobContext, payload: dict) -> dict:
         except AllProvidersFailed as e:
             results[name] = {"ok": False, "error": str(e)[:300]}
     return {"providers": results}
+
+
+# ------------------------------------------------------- public API fetch
+_FETCH_MAX_BYTES = 512_000
+
+
+def _assert_public_https(url: str) -> None:
+    """SSRF guard: only https to hosts that resolve exclusively to public IPs."""
+    import ipaddress
+    import socket
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname:
+        raise PermanentError("only https:// URLs are allowed")
+    try:
+        infos = socket.getaddrinfo(parts.hostname, parts.port or 443, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        raise RuntimeError(f"DNS lookup failed for {parts.hostname}: {e}") from e
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global:
+            raise PermanentError(f"refusing non-public address {ip} for {parts.hostname}")
+
+
+@handler("http.fetch")
+async def http_fetch(ctx: JobContext, payload: dict) -> dict:
+    """GET a public JSON/text API (e.g. one from github.com/public-apis/public-apis).
+
+    payload: {"url": "https://...", "params": {...}, "summarize": "optional LLM instruction"}
+    """
+    import httpx
+
+    url = str(payload.get("url") or "")
+    await asyncio.to_thread(_assert_public_https, url)
+    async with httpx.AsyncClient(timeout=20, follow_redirects=False) as http:
+        resp = await http.get(url, params=payload.get("params") or None,
+                              headers={"User-Agent": "autoplatform/1.0", "Accept": "application/json, text/*"})
+    if resp.status_code == 429 or resp.status_code >= 500:
+        raise RuntimeError(f"upstream HTTP {resp.status_code}")  # retryable
+    body_text = resp.text[:_FETCH_MAX_BYTES]
+    try:
+        data: Any = resp.json()
+    except ValueError:
+        data = body_text
+    out: dict[str, Any] = {"status_code": resp.status_code,
+                           "content_type": resp.headers.get("content-type"), "data": data}
+    if payload.get("summarize") and ctx.router.configured:
+        res = await ctx.router.complete(
+            [{"role": "system", "content": "You summarize API responses concisely."},
+             {"role": "user", "content": f"{payload['summarize']}\n\nAPI response:\n{body_text[:12000]}"}],
+            max_tokens=400, client_id=ctx.client_id, job_id=ctx.job_id)
+        out["summary"] = {"text": res.text, "provider": res.provider}
+    return out

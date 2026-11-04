@@ -111,8 +111,14 @@ class Worker:
     # ------------------------------------------------------------- one job
     async def run_once(self, timeout: int = 1) -> bool:
         await self.queue.promote_due()
+        t0 = time.monotonic()
         job_id = await self.queue.reserve(self.worker_id, timeout)
         if not job_id:
+            # Some backends (fakeredis, proxies) return instantly instead of blocking; never
+            # spin hot — it starves the event loop and burns Upstash's command quota.
+            remaining = timeout - (time.monotonic() - t0)
+            if remaining > 0.05:
+                await asyncio.sleep(min(remaining, 1.0) if timeout <= 2 else remaining)
             return False
         try:
             await self.process(job_id)
@@ -152,7 +158,7 @@ class Worker:
                                         worker_id=self.worker_id, attempt=attempt, client_id=client_id,
                                         duration_ms=ms, error=err + "\n" + traceback.format_exc(limit=5))
             else:
-                delay = min(600.0, 5 * 2 ** (attempt - 1)) * (0.75 + random.random() / 2)
+                delay = min(600.0, self.settings.job_retry_base * 2 ** (attempt - 1)) * (0.75 + random.random() / 2)
                 log.info("job %s attempt %d failed (%s); retrying in %.0fs", job_id, attempt, err, delay)
                 await asyncio.to_thread(repo.finish_job, job_id, status=JobStatus.RETRYING,
                                         worker_id=self.worker_id, attempt=attempt, client_id=client_id,

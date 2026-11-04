@@ -62,6 +62,7 @@ class Settings:
     heartbeat_interval: int
     job_timeout: float
     job_max_attempts: int
+    job_retry_base: float
     log_retention_days: int
 
 
@@ -101,5 +102,6 @@ def get_settings() -> Settings:
         heartbeat_interval=_int("HEARTBEAT_INTERVAL", 60),
         job_timeout=_float("JOB_TIMEOUT_SECONDS", 120.0),
         job_max_attempts=_int("JOB_MAX_ATTEMPTS", 3),
+        job_retry_base=_float("JOB_RETRY_BASE_SECONDS", 5.0),
         log_retention_days=_int("LOG_RETENTION_DAYS", 14),
     )
