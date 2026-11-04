@@ -39,6 +39,35 @@ class ClientIn(BaseModel):
     name: str = Field(min_length=1, max_length=200)
 
 
+# -------------------------------------------------------------- middleware
+class BodySizeLimit:
+    """Rejects request bodies over max_bytes (Content-Length up front, chunked as it streams),
+    so a single oversized webhook cannot exhaust a 512 MB free instance."""
+
+    def __init__(self, app, max_bytes: int):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        declared = dict(scope.get("headers") or []).get(b"content-length")
+        if declared is not None and declared.isdigit() and int(declared) > self.max_bytes:
+            return await JSONResponse({"detail": "payload too large"}, 413)(scope, receive, send)
+        seen = 0
+
+        async def limited_receive():
+            nonlocal seen
+            message = await receive()
+            if message["type"] == "http.request":
+                seen += len(message.get("body", b""))
+                if seen > self.max_bytes:
+                    raise HTTPException(413, "payload too large")
+            return message
+
+        return await self.app(scope, limited_receive, send)
+
+
 # --------------------------------------------------------------------- app
 def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = None,
                router: LLMRouter | None = None) -> FastAPI:
@@ -72,6 +101,7 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
 
     app = FastAPI(title="AutoPlatform", version=VERSION, lifespan=lifespan)
     app.state.settings = settings
+    app.add_middleware(BodySizeLimit, max_bytes=settings.max_body_bytes)
 
     # ------------------------------------------------------------ auth deps
     def _bearer(authorization: str | None) -> str:
@@ -164,8 +194,13 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
 
     @app.get("/metrics")
     async def metrics(format: str = "prometheus", authorization: str | None = Header(default=None)):
-        if settings.metrics_token and not hmac.compare_digest(_bearer(authorization), settings.metrics_token):
-            raise HTTPException(401, "invalid metrics token")
+        token = _bearer(authorization)
+        admin_ok = bool(settings.admin_token) and hmac.compare_digest(token, settings.admin_token)
+        if settings.metrics_token:
+            if not (hmac.compare_digest(token, settings.metrics_token) or admin_ok):
+                raise HTTPException(401, "invalid metrics token")
+        elif settings.app_env == "production" and not settings.metrics_public and not admin_ok:
+            raise HTTPException(401, "metrics need METRICS_TOKEN or ADMIN_TOKEN in production")
         counts, usage, history = await asyncio.gather(
             asyncio.to_thread(repo.job_counts), asyncio.to_thread(repo.usage_summary, 24),
             asyncio.to_thread(repo.workers))
@@ -239,9 +274,7 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
                              x_github_event: str | None = Header(default=None),
                              idempotency_key: str | None = Header(default=None),
                              x_github_delivery: str | None = Header(default=None)):
-        raw = await request.body()
-        if len(raw) > 1_000_000:
-            raise HTTPException(413, "payload too large")
+        raw = await request.body()  # size already capped by BodySizeLimit
         client = await asyncio.to_thread(repo.client_by_slug, client_slug)
         sig = (x_signature_256 or x_hub_signature_256 or "").removeprefix("sha256=")
         if client is None or not sig:

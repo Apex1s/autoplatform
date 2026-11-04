@@ -46,6 +46,8 @@ class Settings:
     admin_token: str
     cron_token: str
     metrics_token: str
+    metrics_public: bool
+    max_body_bytes: int
     auto_migrate: bool
     # LLM
     groq_api_key: str
@@ -100,6 +102,9 @@ def get_settings() -> Settings:
         admin_token=_env("ADMIN_TOKEN"),
         cron_token=_env("CRON_TOKEN") or _env("ADMIN_TOKEN"),
         metrics_token=_env("METRICS_TOKEN"),
+        # production default: /metrics needs METRICS_TOKEN or ADMIN_TOKEN unless this is true
+        metrics_public=_bool("METRICS_PUBLIC", False),
+        max_body_bytes=_int("MAX_BODY_BYTES", 1_000_000),
         auto_migrate=_bool("AUTO_MIGRATE", True),
         groq_api_key=_env("GROQ_API_KEY"),
         groq_model=_env("GROQ_MODEL", "qwen/qwen3.8-27b"),
