@@ -1,0 +1,99 @@
+# Autonomous cron trigger. Every 30 min:
+#   1. wakes the host (HF Spaces / Render free tiers sleep when idle) and checks /healthz
+#   2. fires /cron/maintenance (recover dead workers + stuck jobs, prune old logs)
+#   3. every 6h also fires /cron/provider_probe (per-provider LLM health in /metrics)
+#   4. optional fallback: if the host is down, drain the queue right here in Actions
+#      (set repo variable RUN_DRAIN_FALLBACK=true and the DB/Redis/LLM secrets)
+#
+# Secrets: PLATFORM_URL, CRON_TOKEN  [+ DATABASE_URL, UPSTASH_REDIS_URL, GROQ_API_KEY, GEMINI_API_KEY for fallback]
+# 30-min cadence = ~1,440 billed min/month: fits the 2,000 free minutes of a private repo
+# (public repos are unmetered).
+name: scheduled-runner
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "cron task to fire"
+        type: choice
+        options: [maintenance, provider_probe]
+        default: maintenance
+
+concurrency:
+  group: scheduled-runner
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      PLATFORM_URL: ${{ secrets.PLATFORM_URL }}
+      CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+    steps:
+      - name: Check configuration
+        id: cfg
+        run: |
+          if [ -z "$PLATFORM_URL" ] || [ -z "$CRON_TOKEN" ]; then
+            echo "::notice::PLATFORM_URL / CRON_TOKEN secrets not set yet - skipping."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wake host and check health
+        id: health
+        if: steps.cfg.outputs.configured == 'true'
+        continue-on-error: true
+        run: |
+          for i in $(seq 1 20); do
+            code=$(curl -s -o health.json -w '%{http_code}' --max-time 20 "$PLATFORM_URL/healthz" || echo 000)
+            echo "attempt $i: HTTP $code"
+            if [ "$code" = "200" ]; then cat health.json; echo; exit 0; fi
+            sleep 15
+          done
+          cat health.json 2>/dev/null || true
+          echo "::warning::host not healthy after 5 minutes"
+          exit 1
+
+      - name: Fire cron tasks
+        if: steps.cfg.outputs.configured == 'true' && steps.health.outcome == 'success'
+        run: |
+          fire() {
+            echo "firing $1"
+            curl -fsS --max-time 30 -X POST -H "Authorization: Bearer $CRON_TOKEN" "$PLATFORM_URL/cron/$1"
+            echo
+          }
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            fire "${{ inputs.task }}"
+          else
+            fire maintenance
+            # provider probe every 6 hours (first run of hours 0,6,12,18)
+            if [ $(( $(date -u +%H) % 6 )) -eq 0 ] && [ $(date -u +%M) -lt 30 ]; then fire provider_probe; fi
+          fi
+
+      - name: Set up Python (fallback drain)
+        if: steps.health.outcome == 'failure' && vars.RUN_DRAIN_FALLBACK == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Checkout (fallback drain)
+        if: steps.health.outcome == 'failure' && vars.RUN_DRAIN_FALLBACK == 'true'
+        uses: actions/checkout@v4
+
+      - name: Drain queue inside Actions (host down)
+        if: steps.health.outcome == 'failure' && vars.RUN_DRAIN_FALLBACK == 'true'
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          UPSTASH_REDIS_URL: ${{ secrets.UPSTASH_REDIS_URL }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          pip install -q -r requirements.txt
+          python -m workers.worker --drain --max-seconds 240

@@ -1,0 +1,29 @@
+# Render Blueprint (alternative host). Free web services spin down after ~15 min idle;
+# the GitHub Actions cron wakes it. If Render asks for a credit card, don't continue:
+# use Hugging Face Spaces (see README).
+services:
+  - type: web
+    name: autoplatform
+    runtime: docker
+    plan: free
+    healthCheckPath: /livez
+    autoDeploy: true
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: RUN_EMBEDDED_WORKER
+        value: "true"
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: UPSTASH_REDIS_URL
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ADMIN_TOKEN
+        generateValue: true
+      - key: CRON_TOKEN
+        generateValue: true
