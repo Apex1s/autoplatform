@@ -83,7 +83,7 @@ def get_settings() -> Settings:
         groq_model=_env("GROQ_MODEL", "llama-3.3-70b-versatile"),
         groq_base_url=_env("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
         gemini_api_key=_env("GEMINI_API_KEY"),
-        gemini_model=_env("GEMINI_MODEL", "gemini-2.5-flash"),
+        gemini_model=_env("GEMINI_MODEL", "gemini-flash-lite-latest"),
         gemini_base_url=_env(
             "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai"
         ),
