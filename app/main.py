@@ -21,10 +21,11 @@ from core.queue import TaskQueue
 from db import repo
 from db.migrate import run_migrations
 from models import Client
-from workers.handlers import HANDLERS, SYSTEM_PREFIX, client_job_types
+from core.plans import DEFAULT_PLAN, PLANS, RESERVED_SLUGS, effective_handlers, effective_limit
+from workers.handlers import HANDLERS, INTERNAL_PREFIX, SYSTEM_PREFIX, client_job_types
 from workers.worker import Worker
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 API_KEY_RE = re.compile(r"ap_[A-Za-z0-9_-]{43}")
 log = logging.getLogger("autoplatform.api")
 
@@ -40,6 +41,12 @@ class TaskIn(BaseModel):
 class ClientIn(BaseModel):
     slug: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{2,39}$")
     name: str = Field(min_length=1, max_length=200)
+    plan: str = DEFAULT_PLAN
+    monthly_job_limit: int | None = Field(default=None, ge=0, le=10_000_000)
+    allowed_handlers: list[str] | None = None
+    outbound_webhook_url: str | None = None
+    config: dict[str, Any] | None = None
+    contact_email: str | None = Field(default=None, max_length=200)
 
 
 # -------------------------------------------------------------- middleware
@@ -177,6 +184,24 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
         return {"job_id": job.id, "status": "queued", "type": type_,
                 "status_url": f"{_base(request)}/tasks/{job.id}"}
 
+    async def _admit(client: Client, job_type: str) -> None:
+        """Plan enforcement: allowed handlers + month-to-date quota (one Redis INCR)."""
+        allowed = effective_handlers(client.plan, client.allowed_handlers)
+        if allowed is not None and job_type not in allowed:
+            raise HTTPException(403, f"'{job_type}' is not enabled on the {client.plan} plan")
+        limit = effective_limit(client.plan, client.monthly_job_limit)
+        if not limit:
+            return
+        q: TaskQueue = app.state.queue
+        try:
+            n = await q.quota_incr(client.id)
+        except Exception:
+            log.exception("quota counter unavailable; admitting request")
+            return
+        if n > limit:
+            await q.quota_decr(client.id)
+            raise HTTPException(429, f"monthly job limit of {limit} reached on the {client.plan} plan")
+
     # --------------------------------------------------------------- routes
     @app.get("/")
     async def root():
@@ -289,11 +314,15 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
     @app.post("/webhook", status_code=202)
     async def webhook(task: TaskIn, request: Request, client: Client = Depends(require_client),
                       idempotency_key: str | None = Header(default=None)):
-        if task.type not in HANDLERS or task.type.startswith(SYSTEM_PREFIX):
+        if task.type not in HANDLERS or task.type.startswith((SYSTEM_PREFIX, INTERNAL_PREFIX)):
             raise HTTPException(422, f"unknown job type; allowed: {client_job_types()}")
-        return await _enqueue(task.type, task.payload, client_id=client.id, source="webhook", request=request,
-                              max_attempts=task.max_attempts, delay=task.delay_seconds,
-                              idempotency_key=idempotency_key)
+        await _admit(client, task.type)
+        out = await _enqueue(task.type, task.payload, client_id=client.id, source="webhook", request=request,
+                             max_attempts=task.max_attempts, delay=task.delay_seconds,
+                             idempotency_key=idempotency_key)
+        if out.get("duplicate"):
+            await app.state.queue.quota_decr(client.id)
+        return out
 
     app.post("/tasks", status_code=202, include_in_schema=False)(webhook)  # alias
 
@@ -308,30 +337,10 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
     async def list_tasks(limit: int = 50, client: Client = Depends(require_client)):
         return await asyncio.to_thread(repo.list_jobs, client.id, max(1, min(limit, 200)))
 
-    # ---- signed third-party webhooks (GitHub/Stripe-style HMAC-SHA256)
-    @app.post("/webhook/{client_slug}", status_code=202)
-    async def signed_webhook(client_slug: str, request: Request,
-                             x_signature_256: str | None = Header(default=None),
-                             x_hub_signature_256: str | None = Header(default=None),
-                             x_event_type: str | None = Header(default=None),
-                             x_github_event: str | None = Header(default=None),
-                             idempotency_key: str | None = Header(default=None),
-                             x_github_delivery: str | None = Header(default=None)):
-        raw = await request.body()  # size already capped by BodySizeLimit
-        client = await asyncio.to_thread(repo.client_by_slug, client_slug)
-        sig = (x_signature_256 or x_hub_signature_256 or "").removeprefix("sha256=")
-        if client is None or not sig:
-            raise HTTPException(401, "invalid signature")
-        expected = hmac.new(client.webhook_secret.encode(), raw, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected):
-            raise HTTPException(401, "invalid signature")
-        try:
-            body = await request.json()
-        except Exception:
-            body = {"raw": raw.decode(errors="replace")[:10000]}
-        payload = {"event": x_event_type or x_github_event, "body": body}
-        return await _enqueue("webhook.event", payload, client_id=client.id, source="signed_webhook", request=request,
-                              idempotency_key=idempotency_key or x_github_delivery)
+    # ---- monetization: self-serve, agencies, billing, signed ingest, demo (app/monetization.py)
+    from app.monetization import Hooks, install
+    install(app, Hooks(settings=settings, enqueue=_enqueue, admit=_admit, base=_base, require_admin=require_admin,
+                       require_cron=require_cron, require_client=require_client))
 
     # ---- cron triggers (GitHub Actions)
     CRON_JOBS = {"maintenance": "system.maintenance", "provider_probe": "system.provider_probe"}
@@ -358,14 +367,19 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
     # ---- admin
     @app.post("/admin/clients", status_code=201, dependencies=[Depends(require_admin)])
     async def create_client(body: ClientIn, request: Request):
+        if body.slug in RESERVED_SLUGS:
+            raise HTTPException(422, "slug is reserved")
+        if body.plan not in PLANS:
+            raise HTTPException(422, f"unknown plan; available: {sorted(PLANS)}")
         if await asyncio.to_thread(repo.client_by_slug, body.slug):
             raise HTTPException(409, "slug already exists")
-        c, api_key = await asyncio.to_thread(repo.create_client, body.slug, body.name)
-        return {"id": c.id, "slug": c.slug, "name": c.name,
-                "api_key": api_key, "webhook_secret": c.webhook_secret,
-                "webhook_url": f"{_base(request)}/webhook",
-                "signed_webhook_url": f"{_base(request)}/webhook/{c.slug}",
-                "note": "api_key is shown once; store it now."}
+        from app.monetization import check_handlers, check_https, credentials
+        c, api_key = await asyncio.to_thread(
+            repo.create_client, body.slug, body.name, plan=body.plan, monthly_job_limit=body.monthly_job_limit,
+            allowed_handlers=check_handlers(body.allowed_handlers),
+            outbound_webhook_url=check_https(body.outbound_webhook_url), config=body.config,
+            contact_email=body.contact_email)
+        return credentials(c, api_key, _base(request))
 
     @app.delete("/admin/clients/{slug}", dependencies=[Depends(require_admin)])
     async def deactivate_client(slug: str):

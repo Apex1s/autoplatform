@@ -36,7 +36,7 @@ export function ioRedis(client: Redis): RedisCmd {
   return {
     cmd: (args) => client.call(String(args[0]), ...args.slice(1).map(String)) as Promise<any>,
     async pipeline(cmds) {
-      const res = await client.pipeline(cmds.map((c) => c.map(String)) as any).exec();
+      const res = await client.pipeline(cmds.map((c) => [String(c[0]).toLowerCase(), ...c.slice(1).map(String)]) as any).exec();
       return (res ?? []).map(([err, v]) => {
         if (err) throw err;
         return v;
@@ -103,7 +103,7 @@ export interface Infra {
   redis: Redis;
   llm: FakeLLM;
   prefix: string;
-  deps: (env?: Env, budget?: number) => ReturnType<typeof makeDeps>;
+  deps: (env?: Env, budget?: number, httpFetch?: typeof fetch) => ReturnType<typeof makeDeps>;
   close: () => Promise<void>;
 }
 
@@ -117,8 +117,8 @@ export async function setupInfra(): Promise<Infra> {
   const rc = ioRedis(redis);
   return {
     pool, redis, llm, prefix,
-    deps: (env = {}, budget?: number) =>
-      makeDeps({ ...baseEnv, QUEUE_PREFIX: prefix, ...env }, { db, redis: rc, llmFetch: llm.fetch, sleepFn: async () => {}, budget }),
+    deps: (env = {}, budget?: number, httpFetch?: typeof fetch) =>
+      makeDeps({ ...baseEnv, QUEUE_PREFIX: prefix, ...env }, { db, redis: rc, llmFetch: llm.fetch, sleepFn: async () => {}, budget, httpFetch }),
     async close() {
       const keys = await redis.keys(`${prefix}:*`);
       if (keys.length) await redis.del(...keys);
@@ -135,3 +135,21 @@ export const req = (method: string, path: string, o: { body?: unknown; raw?: Bod
     body: o.raw ?? (o.body !== undefined ? JSON.stringify(o.body) : undefined),
     ...(o.raw instanceof ReadableStream ? { duplex: "half" } : {}),
   } as RequestInit);
+
+/** LLM reply whose content is the given JSON object (what JSON mode returns). */
+export const llmJson = (obj: unknown): [number, Record<string, string>, unknown] =>
+  [200, {}, { model: "m", usage: { prompt_tokens: 50, completion_tokens: 40 }, choices: [{ message: { role: "assistant", content: JSON.stringify(obj) } }] }];
+
+/** Captures outbound deliveries; can fail the first N with 503. */
+export class Sink {
+  requests: { url: string; headers: Headers; body: string }[] = [];
+  failFirst = 0;
+  fetch: typeof fetch = async (input, init) => {
+    this.requests.push({ url: String(input), headers: new Headers(init?.headers), body: String(init?.body ?? "") });
+    if (this.failFirst > 0) {
+      this.failFirst--;
+      return new Response("busy", { status: 503 });
+    }
+    return Response.json({ ok: true });
+  };
+}

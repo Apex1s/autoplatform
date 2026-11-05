@@ -9,7 +9,7 @@
     "test": "vitest run",
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "live": "tsx scripts/live.ts"
+    "live": "tsx --import ./scripts/register-html.mjs scripts/live.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "1.2.0"

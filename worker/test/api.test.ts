@@ -1,7 +1,7 @@
 // Integration: the real request handlers + runner against Postgres 16 and Redis 7.
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { handle } from "../src/api";
-import { MIGRATION_V1_DESC } from "../src/db";
+import { MIGRATION_V1_DESC, MIGRATION_V2_DESC } from "../src/db";
 import { drain, runCron } from "../src/runner";
 import { hmacSha256Hex } from "../src/util";
 import { HAVE_INFRA, type Infra, req, setupInfra, TestCtx } from "./helpers";
@@ -41,13 +41,14 @@ describe.skipIf(!HAVE_INFRA)("worker API (Postgres + Redis)", () => {
     const { res, body } = await call(req("GET", "/admin/clients", { headers: ADMIN }));
     expect(res.status).toBe(200);
     expect(body).toEqual([]);
-    const rows = (await infra.pool.query("SELECT version, description FROM schema_migrations")).rows;
-    expect(rows).toEqual([{ version: 1, description: MIGRATION_V1_DESC }]);
+    const rows = (await infra.pool.query("SELECT version, description FROM schema_migrations ORDER BY version")).rows;
+    expect(rows).toEqual([{ version: 1, description: MIGRATION_V1_DESC }, { version: 2, description: MIGRATION_V2_DESC }]);
   });
 
   it("root, livez and healthz (degraded until the first cron run, then ok)", async () => {
     expect((await call(req("GET", "/livez"))).body).toEqual({ status: "alive" });
-    expect((await call(req("GET", "/"))).body.job_types).toEqual(["echo", "http.fetch", "llm.complete", "webhook.event"]);
+    expect((await call(req("GET", "/"))).body.job_types).toEqual(["echo", "http.fetch", "lead_qualifier", "llm.complete",
+      "stripe_churn_rescuer", "support_ticket_router", "usage_reporter", "webhook.event", "whatsapp_order_triage"]);
     let h = await call(req("GET", "/healthz"));
     expect(h.res.status).toBe(200);
     expect(h.body.checks).toMatchObject({ database: "ok", redis: "ok", worker: "waiting for first cron run" });

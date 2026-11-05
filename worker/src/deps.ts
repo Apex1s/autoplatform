@@ -13,12 +13,14 @@ export interface Deps {
   router: LLMRouter;
   budget: Budget;
   workerId: string;
+  httpFetch: typeof fetch; // outbound deliveries (tests inject a capture)
 }
 
 export interface DepOverrides {
   db?: Db;               // raw Db (tests: node-postgres); budget + lazy migration are added here
   redis?: RedisCmd;      // raw Redis (tests: ioredis)
   llmFetch?: typeof fetch;
+  httpFetch?: typeof fetch;
   sleepFn?: (ms: number) => Promise<void>;
   budget?: number;
 }
@@ -55,5 +57,6 @@ export function makeDeps(env: Env, o: DepOverrides = {}): Deps {
     sleepFn: o.sleepFn,
     cooldowns: { get: (p) => queue.cooldowns(p), set: (p, s) => queue.setCooldown(p, s) },
   });
-  return { cfg, db: managedDb(rawDb, budget), queue, router, budget, workerId: "cloudflare-worker" };
+  return { cfg, db: managedDb(rawDb, budget), queue, router, budget, workerId: "cloudflare-worker",
+           httpFetch: o.httpFetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a)) };
 }

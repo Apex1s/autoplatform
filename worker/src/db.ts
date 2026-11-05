@@ -66,22 +66,42 @@ export const MIGRATION_V1: string[] = [
   `CREATE INDEX IF NOT EXISTS ix_worker_health_last_heartbeat ON worker_health (last_heartbeat)`,
 ];
 
+// v2 = same columns/indexes as db/migrate.py's _v2_monetization.
+export const MIGRATION_V2_DESC = "monetization: plans, quotas, outbound delivery, agencies, billing";
+export const MIGRATION_V2: string[] = [
+  `ALTER TABLE clients ADD COLUMN IF NOT EXISTS plan VARCHAR(32) NOT NULL DEFAULT 'retainer'`,
+  `ALTER TABLE clients ADD COLUMN IF NOT EXISTS monthly_job_limit INTEGER`,
+  `ALTER TABLE clients ADD COLUMN IF NOT EXISTS allowed_handlers JSON`,
+  `ALTER TABLE clients ADD COLUMN IF NOT EXISTS outbound_webhook_url TEXT`,
+  `ALTER TABLE clients ADD COLUMN IF NOT EXISTS config JSON`,
+  `ALTER TABLE clients ADD COLUMN IF NOT EXISTS agency_id VARCHAR(32) REFERENCES clients (id) ON DELETE SET NULL`,
+  `ALTER TABLE clients ADD COLUMN IF NOT EXISTS contact_email VARCHAR(200)`,
+  `ALTER TABLE clients ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(64)`,
+  `CREATE INDEX IF NOT EXISTS ix_clients_agency_id ON clients (agency_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS ix_clients_stripe_customer_id ON clients (stripe_customer_id)`,
+  `CREATE INDEX IF NOT EXISTS ix_jobs_client_created ON jobs (client_id, created_at)`,
+];
+
 export async function migrate(db: Db): Promise<void> {
+  const record = (v: number, d: string) => ({
+    text: "INSERT INTO schema_migrations (version, description, applied_at) VALUES ($1, $2, now()) ON CONFLICT (version) DO NOTHING",
+    params: [v, d],
+  });
   await db.transaction([
     { text: "SELECT pg_advisory_xact_lock(727001)" }, // same lock id as the Python migrator
     ...MIGRATION_V1.map((text) => ({ text })),
-    {
-      text: "INSERT INTO schema_migrations (version, description, applied_at) VALUES (1, $1, now()) ON CONFLICT (version) DO NOTHING",
-      params: [MIGRATION_V1_DESC],
-    },
+    record(1, MIGRATION_V1_DESC),
+    ...MIGRATION_V2.map((text) => ({ text })),
+    record(2, MIGRATION_V2_DESC),
   ]);
 }
 
-const isMissingTable = (e: unknown) => (e as { code?: string })?.code === "42P01";
+// 42P01 undefined_table (fresh DB), 42703 undefined_column (DB on an older schema version)
+const isMissingTable = (e: unknown) => ["42P01", "42703"].includes((e as { code?: string })?.code ?? "");
 
 /**
  * Wraps a Db with (1) the per-invocation subrequest budget and (2) lazy migration: the schema
- * is only created when a query hits "relation does not exist", so routine traffic never spends
+ * is only created/upgraded when a query hits a missing table or column, so routine traffic never spends
  * a round trip (or wakes Neon) just to check the schema.
  */
 export function managedDb(inner: Db, budget: Budget): Db {

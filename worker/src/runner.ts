@@ -4,7 +4,9 @@
 //       runs maintenance at :17/:47 and probes providers every 6 hours.
 // Claiming is the same atomic UPDATE as the Python worker, so delivery is at least once.
 import type { Deps } from "./deps";
-import { HANDLERS, type JobCtx } from "./handlers";
+import type { JobCtx } from "./handlers";
+import { enqueueWeeklyReports } from "./products";
+import { HANDLERS } from "./registry";
 import { attemptsToUsage, AllProvidersFailed } from "./llm";
 import * as repo from "./repo";
 import { BudgetExceeded, PermanentError } from "./util";
@@ -25,7 +27,7 @@ export async function processJob(deps: Deps, jobId: string): Promise<Outcome> {
   const { db, queue, cfg } = deps;
   const job = await repo.claimJob(db, jobId);
   if (!job) return "skipped"; // duplicate id or already finished
-  const ctx: JobCtx = { jobId, clientId: job.client_id, attempt: job.attempts, deps, usage: [] };
+  const ctx: JobCtx = { jobId, clientId: job.client_id, attempt: job.attempts, createdAt: job.created_at, deps, usage: [] };
   const started = Date.now();
   const fn = HANDLERS[job.type] ?? SYSTEM_HANDLERS[job.type];
   try {
@@ -119,6 +121,7 @@ export async function runCron(deps: Deps, scheduledTime: number) {
     summary.promoted = await deps.queue.promoteDue();
     if (minute === 17 || minute === 47) summary.maintenance = await maintenance(deps);
     if (minute === 17 && hour % 6 === 0) summary.provider_probe = await providerProbe(deps);
+    if (minute === 17 && hour === 8 && t.getUTCDay() === 1) summary.weekly_reports = (await enqueueWeeklyReports(deps)).length;
     summary.drain = await drain(deps, { maxJobs: 4, deadline: Date.now() + 25_000 });
   } catch (e) {
     summary.error = String((e as Error).message).slice(0, 300);

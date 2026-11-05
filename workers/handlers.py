@@ -25,6 +25,7 @@ class JobContext:
     router: LLMRouter
     queue: TaskQueue
     settings: Any
+    created_at: str | None = None  # ISO time the job was accepted (webhook received)
 
 
 Handler = Callable[[JobContext, dict], Awaitable[dict]]
@@ -39,8 +40,11 @@ def handler(name: str):
     return deco
 
 
+INTERNAL_PREFIX = "internal."
+
+
 def client_job_types() -> list[str]:
-    return sorted(n for n in HANDLERS if not n.startswith(SYSTEM_PREFIX))
+    return sorted(n for n in HANDLERS if not n.startswith((SYSTEM_PREFIX, INTERNAL_PREFIX)))
 
 
 # ------------------------------------------------------------ client jobs
@@ -214,3 +218,8 @@ async def http_fetch(ctx: JobContext, payload: dict) -> dict:
             max_tokens=400, client_id=ctx.client_id, job_id=ctx.job_id)
         out["summary"] = {"text": res.text, "provider": res.provider}
     return out
+
+
+# Product handlers live in their own modules; importing them registers them in HANDLERS.
+from workers import delivery as _delivery  # noqa: E402,F401
+from workers import products as _products  # noqa: E402,F401

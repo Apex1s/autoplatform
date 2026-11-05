@@ -8,6 +8,7 @@ export interface JobCtx {
   jobId: string;
   clientId: string | null;
   attempt: number;
+  createdAt?: string | null; // when the webhook was accepted
   deps: Deps;
   usage: UsageRecord[]; // LLM attempts made by this job, saved with the job result
 }
@@ -142,9 +143,8 @@ const httpFetch: Handler = async (ctx, payload) => {
   return out;
 };
 
-// System jobs are implemented in runner.ts (they need the queue/maintenance helpers);
-// registered here so /cron can enqueue them like the Python app does.
-export const HANDLERS: Record<string, Handler> = {
+// Base handlers; the full registry (with products + delivery) lives in registry.ts.
+export const BASE_HANDLERS: Record<string, Handler> = {
   echo,
   "llm.complete": llmComplete,
   "webhook.event": webhookEvent,
@@ -152,4 +152,4 @@ export const HANDLERS: Record<string, Handler> = {
 };
 
 export const SYSTEM_PREFIX = "system.";
-export const clientJobTypes = () => Object.keys(HANDLERS).filter((n) => !n.startsWith(SYSTEM_PREFIX)).sort();
+export const INTERNAL_PREFIX = "internal.";

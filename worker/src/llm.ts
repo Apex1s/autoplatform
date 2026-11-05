@@ -32,6 +32,7 @@ export class AllProvidersFailed extends Error {
 export interface Attempt {
   provider: string; model: string; success: boolean; status_code: number | null; error_kind: Kind | null;
   prompt_tokens: number; completion_tokens: number; latency_ms: number; round: number; retry: number;
+  simulated?: boolean; // demo-only synthetic failure, never billed or recorded as usage
 }
 
 export interface LLMResult {
@@ -101,14 +102,14 @@ export class LLMRouter {
     return d * (0.5 + Math.random() / 2);
   }
 
-  private async call(p: Provider, messages: Message[], maxTokens: number, temperature: number) {
+  private async call(p: Provider, messages: Message[], maxTokens: number, temperature: number, extra?: Record<string, unknown>) {
     const started = Date.now();
     let res: Response;
     try {
       res = await this.o.fetchFn(`${p.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
         method: "POST",
         headers: { authorization: `Bearer ${p.apiKey}`, "content-type": "application/json" },
-        body: JSON.stringify({ model: p.model, messages, max_tokens: maxTokens, temperature }),
+        body: JSON.stringify({ model: p.model, messages, max_tokens: maxTokens, temperature, ...(extra ?? {}) }),
         signal: AbortSignal.timeout(p.timeoutMs),
       });
     } catch (e) {
@@ -139,11 +140,21 @@ export class LLMRouter {
     };
   }
 
-  async complete(messages: Message[], o: { maxTokens?: number; temperature?: number; only?: string[] } = {}): Promise<LLMResult> {
-    const pool = this.providers.filter((p) => !o.only || o.only.includes(p.name));
+  /** responseFormat {type:"json_object"} = JSON mode on both providers. simulateFailure (demo only) records a
+   *  labelled synthetic 429 for that provider instead of calling it; shared cooldowns are untouched. */
+  async complete(messages: Message[], o: { maxTokens?: number; temperature?: number; only?: string[];
+                                           responseFormat?: Record<string, unknown>; simulateFailure?: string } = {}): Promise<LLMResult> {
+    let pool = this.providers.filter((p) => !o.only || o.only.includes(p.name));
     if (!pool.length) throw new AllProvidersFailed([]);
     const errors: ProviderError[] = [];
     const attempts: Attempt[] = [];
+    const extra = o.responseFormat ? { response_format: o.responseFormat } : undefined;
+    if (o.simulateFailure && pool.length > 1 && pool.some((p) => p.name === o.simulateFailure)) {
+      attempts.push({ provider: o.simulateFailure, model: "-", success: false, status_code: 429, error_kind: "rate_limit",
+        prompt_tokens: 0, completion_tokens: 0, latency_ms: 0, round: 0, retry: 0, simulated: true });
+      errors.push(new ProviderError(o.simulateFailure, "rate_limit", "simulated outage (demo)", 429));
+      pool = pool.filter((p) => p.name !== o.simulateFailure);
+    }
     let shared: Record<string, number> = {};
     try {
       shared = this.o.cooldowns ? await this.o.cooldowns.get(pool.map((p) => p.name)) : {};
@@ -163,7 +174,7 @@ export class LLMRouter {
       for (const p of ready) {
         for (let retry = 0; retry <= this.o.maxRetries; retry++) {
           try {
-            const r = await this.call(p, messages, o.maxTokens ?? 512, o.temperature ?? 0.2);
+            const r = await this.call(p, messages, o.maxTokens ?? 512, o.temperature ?? 0.2, extra);
             attempts.push({ provider: p.name, model: r.model, success: true, status_code: 200, error_kind: null,
               prompt_tokens: r.prompt_tokens, completion_tokens: r.completion_tokens, latency_ms: r.latency_ms, round, retry });
             return { ...r, provider: p.name, total_tokens: r.prompt_tokens + r.completion_tokens, attempts };

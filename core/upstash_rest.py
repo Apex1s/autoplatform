@@ -78,6 +78,18 @@ class UpstashRestRedis:
     async def exists(self, *keys) -> int:
         return int(await self.execute("EXISTS", *keys))
 
+    async def incr(self, key) -> int:
+        return int(await self.execute("INCR", key))
+
+    async def decr(self, key) -> int:
+        return int(await self.execute("DECR", key))
+
+    async def expire(self, key, seconds) -> int:
+        return int(await self.execute("EXPIRE", key, int(seconds)))
+
+    async def getdel(self, key):
+        return await self.execute("GETDEL", key)
+
     # ---- lists
     async def lpush(self, key, *values) -> int:
         return int(await self.execute("LPUSH", key, *values))

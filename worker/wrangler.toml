@@ -7,6 +7,12 @@ main = "src/index.ts"
 compatibility_date = "2026-10-01"
 workers_dev = true
 
+# the live demo page (../monetization/demo/index.html) is bundled as a text module
+[[rules]]
+type = "Text"
+globs = ["**/*.html"]
+fallthrough = false
+
 [triggers]
 crons = ["* * * * *"]   # every minute: promote retries, drain the queue; maintenance at :17/:47
 

@@ -1,0 +1,18 @@
+{
+  "business_name": "Casa Pizza",
+  "default_handler": "whatsapp_order_triage",
+  "meta_verify_token": "choose-a-long-random-string",
+  "meta_app_secret": "your-meta-app-secret",
+  "order": {
+    "currency": "MAD",
+    "delivery_fee": 15,
+    "min_order": 60,
+    "tax_rate": 0,
+    "catalog": [
+      {"sku": "PIZ-MAR", "name": "Margherita pizza", "price": 55, "aliases": ["margherita", "marguerite"]},
+      {"sku": "PIZ-4F", "name": "Quattro formaggi pizza", "price": 75, "aliases": ["4 fromages", "quatre fromages"]},
+      {"sku": "COK-33", "name": "Coca-Cola 33cl", "price": 10, "aliases": ["coca", "coke"]}
+    ]
+  },
+  "hourly_rate_usd": 15
+}

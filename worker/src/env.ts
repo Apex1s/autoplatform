@@ -29,6 +29,12 @@ export interface Env {
   MAX_BODY_BYTES?: string;
   SUBREQUEST_BUDGET?: string;
   HEALTHZ_CACHE_SECONDS?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
+  STRIPE_PLAN_BY_LINK?: string;
+  OPERATOR_NOTIFY_URL?: string;
+  DEMO_ENABLED?: string;
+  DEMO_DAILY_LIMIT?: string;
+  DEMO_IP_HOURLY_LIMIT?: string;
 }
 
 export interface Config {
@@ -61,6 +67,12 @@ export interface Config {
   maxBodyBytes: number;
   subrequestBudget: number;
   healthzCacheS: number;
+  stripeWebhookSecret: string;
+  stripePlanByLink: Record<string, string>;
+  operatorNotifyUrl: string;
+  demoEnabled: boolean;
+  demoDailyLimit: number;
+  demoIpHourlyLimit: number;
 }
 
 const str = (v: string | undefined, d = "") => (v ?? "").trim() || d;
@@ -72,6 +84,15 @@ const bool = (v: string | undefined, d: boolean) => {
   const s = (v ?? "").trim().toLowerCase();
   return s === "" ? d : ["1", "true", "yes", "on"].includes(s);
 };
+
+function jsonEnv(v: string | undefined): Record<string, string> {
+  try {
+    const o = JSON.parse((v ?? "").trim() || "{}");
+    return o && typeof o === "object" && !Array.isArray(o) ? o : {};
+  } catch {
+    return {};
+  }
+}
 
 /** rediss://default:TOKEN@HOST:6379 -> { url: https://HOST, token: TOKEN } (Upstash REST shares the password). */
 export function upstashRestFromUrl(redisUrl: string): { url: string; token: string } | null {
@@ -121,6 +142,14 @@ export function loadConfig(env: Env): Config {
     subrequestBudget: num(env.SUBREQUEST_BUDGET, 45),
     // public endpoint: don't let /healthz spam wake Neon on every request
     healthzCacheS: num(env.HEALTHZ_CACHE_SECONDS, 15),
+    // platform billing: POST /webhook/stripe auto-provisions paying customers
+    stripeWebhookSecret: str(env.STRIPE_WEBHOOK_SECRET),
+    stripePlanByLink: jsonEnv(env.STRIPE_PLAN_BY_LINK),
+    operatorNotifyUrl: str(env.OPERATOR_NOTIFY_URL),
+    // public live demo at /demo (rate-limited, never sends anything outbound)
+    demoEnabled: bool(env.DEMO_ENABLED, true),
+    demoDailyLimit: num(env.DEMO_DAILY_LIMIT, 300),
+    demoIpHourlyLimit: num(env.DEMO_IP_HOURLY_LIMIT, 30),
   };
 }
 

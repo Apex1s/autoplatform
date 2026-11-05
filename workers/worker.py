@@ -194,7 +194,8 @@ class Worker:
             return
         attempt, client_id = job["attempts"], job["client_id"]
         fn = HANDLERS.get(job["type"])
-        ctx = JobContext(job_id, client_id, attempt, self.worker_id, self.router, self.queue, self.settings)
+        ctx = JobContext(job_id, client_id, attempt, self.worker_id, self.router, self.queue, self.settings,
+                         created_at=job.get("created_at"))
         started = time.perf_counter()
         try:
             if fn is None:

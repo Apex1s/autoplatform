@@ -123,6 +123,64 @@ export class Queue {
     return await this.r.cmd(["GET", k]);
   }
 
+  // --- quotas, rate limits, one-time secrets (same keys as core/queue.py)
+  private quotaKey(clientId: string): string {
+    const d = new Date();
+    return `${this.prefix}:quota:${clientId}:${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+  }
+
+  /** Month-to-date job counter: INCR + TTL in one round trip. */
+  async quotaIncr(clientId: string): Promise<number> {
+    const k = this.quotaKey(clientId);
+    const [n] = await this.r.pipeline([["INCR", k], ["EXPIRE", k, 40 * 86400]]);
+    return Number(n);
+  }
+
+  async quotaDecr(clientId: string): Promise<void> {
+    await this.r.cmd(["DECR", this.quotaKey(clientId)]);
+  }
+
+  async quotaGet(clientId: string): Promise<number> {
+    return Number((await this.r.cmd(["GET", this.quotaKey(clientId)])) ?? 0);
+  }
+
+  async overRate(key: string, windowS: number, limit: number): Promise<boolean> {
+    const k = `${this.prefix}:rl:${key}`;
+    const [n, ttl] = await this.r.pipeline([["INCR", k], ["TTL", k]]);
+    if (Number(ttl) < 0) await this.r.cmd(["EXPIRE", k, windowS]);
+    return Number(n) > limit;
+  }
+
+  /** Several fixed-window counters in ONE round trip; returns which keys are over their limit. */
+  async overRates(limits: { key: string; windowS: number; limit: number }[]): Promise<boolean[]> {
+    const keys = limits.map((l) => `${this.prefix}:rl:${l.key}`);
+    const res = await this.r.pipeline(keys.flatMap((k) => [["INCR", k], ["TTL", k]]));
+    const fix = limits.flatMap((l, i) => (Number(res[i * 2 + 1]) < 0 ? [["EXPIRE", keys[i], l.windowS]] : []));
+    if (fix.length) await this.r.pipeline(fix);
+    return limits.map((l, i) => Number(res[i * 2]) > l.limit);
+  }
+
+  async putSecret(key: string, value: string, ttlS: number): Promise<void> {
+    await this.r.cmd(["SET", `${this.prefix}:secret:${key}`, value, "EX", ttlS]);
+  }
+
+  async takeSecret(key: string): Promise<string | null> {
+    return (await this.r.cmd(["GETDEL", `${this.prefix}:secret:${key}`])) ?? null;
+  }
+
+  async peekSecret(key: string): Promise<string | null> {
+    return (await this.r.cmd(["GET", `${this.prefix}:secret:${key}`])) ?? null;
+  }
+
+  async releaseIdempotency(key: string): Promise<void> {
+    await this.r.cmd(["DEL", `${this.prefix}:idem:${key}`]);
+  }
+
+  /** LPUSH many ids in one command (bulk-created delivery / report jobs). */
+  async enqueueMany(ids: string[]): Promise<void> {
+    if (ids.length) await this.r.cmd(["LPUSH", this.pending, ...ids]);
+  }
+
   // --- scheduler liveness (stands in for worker heartbeats on a serverless runtime)
   async markCronRun(info: Record<string, unknown>): Promise<void> {
     await this.r.cmd(["SET", `${this.prefix}:cron:last`, JSON.stringify({ ...info, ts: Date.now() / 1000 }), "EX", 86400]);

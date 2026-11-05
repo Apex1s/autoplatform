@@ -47,6 +47,18 @@ class Client(Base):
     webhook_secret: Mapped[str] = mapped_column(String(128))
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # --- v2: monetization (plans, quotas, outbound delivery, agencies, billing)
+    plan: Mapped[str] = mapped_column(String(32), default="retainer", server_default="retainer")
+    monthly_job_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    allowed_handlers: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    outbound_webhook_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    agency_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("clients.id", ondelete="SET NULL"), nullable=True, index=True)
+    contact_email: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    stripe_customer_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    __table_args__ = (Index("ix_clients_stripe_customer_id", "stripe_customer_id", unique=True),)
 
 
 class Job(Base):
@@ -68,7 +80,8 @@ class Job(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    __table_args__ = (Index("ix_jobs_status_run_at", "status", "run_at"),)
+    __table_args__ = (Index("ix_jobs_status_run_at", "status", "run_at"),
+                      Index("ix_jobs_client_created", "client_id", "created_at"))
 
 
 class ExecutionLog(Base):

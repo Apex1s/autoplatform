@@ -27,6 +27,17 @@ def _int(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
+def _json_env(name: str) -> dict:
+    import json
+
+    raw = _env(name)
+    try:
+        value = json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def _float(name: str, default: float) -> float:
     raw = _env(name)
     return float(raw) if raw else default
@@ -52,6 +63,12 @@ class Settings:
     metrics_token: str
     metrics_public: bool
     max_body_bytes: int
+    stripe_webhook_secret: str
+    stripe_plan_by_link: dict
+    operator_notify_url: str
+    demo_enabled: bool
+    demo_daily_limit: int
+    demo_ip_hourly_limit: int
     auto_migrate: bool
     # LLM
     groq_api_key: str
@@ -115,6 +132,14 @@ def get_settings() -> Settings:
         # production default: /metrics needs METRICS_TOKEN or ADMIN_TOKEN unless this is true
         metrics_public=_bool("METRICS_PUBLIC", False),
         max_body_bytes=_int("MAX_BODY_BYTES", 1_000_000),
+        # platform billing (POST /webhook/stripe auto-provisions paying customers)
+        stripe_webhook_secret=_env("STRIPE_WEBHOOK_SECRET"),
+        stripe_plan_by_link=_json_env("STRIPE_PLAN_BY_LINK"),
+        operator_notify_url=_env("OPERATOR_NOTIFY_URL"),
+        # public live demo at /demo (rate-limited, never sends anything outbound)
+        demo_enabled=_bool("DEMO_ENABLED", True),
+        demo_daily_limit=_int("DEMO_DAILY_LIMIT", 300),
+        demo_ip_hourly_limit=_int("DEMO_IP_HOURLY_LIMIT", 30),
         auto_migrate=_bool("AUTO_MIGRATE", True),
         groq_api_key=_env("GROQ_API_KEY"),
         groq_model=_env("GROQ_MODEL", "qwen/qwen3.8-27b"),

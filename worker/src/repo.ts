@@ -1,5 +1,6 @@
 // SQL for every operation. Mirrors db/repo.py so both runtimes behave the same.
 import type { Db, Statement } from "./db";
+import { DEFAULT_PLAN, effectiveHandlers, effectiveLimit } from "./plans";
 import { iso, newId, randomHex, randomToken, sha256Hex } from "./util";
 
 export const STATUS = { QUEUED: "queued", RUNNING: "running", RETRYING: "retrying", SUCCEEDED: "succeeded", FAILED: "failed" } as const;
@@ -12,6 +13,43 @@ export interface ClientRow {
   webhook_secret: string;
   active: boolean;
   created_at: unknown;
+  plan: string;
+  monthly_job_limit: number | null;
+  allowed_handlers: string[] | null;
+  outbound_webhook_url: string | null;
+  config: Record<string, any> | null;
+  agency_id: string | null;
+  contact_email: string | null;
+  stripe_customer_id: string | null;
+}
+
+const CLIENT_COLS = `id, slug, name, webhook_secret, active, created_at, plan, monthly_job_limit, allowed_handlers,
+  outbound_webhook_url, config, agency_id, contact_email, stripe_customer_id`;
+
+function clientRow(r: Record<string, any> | undefined): ClientRow | null {
+  if (!r) return null;
+  return { ...r, allowed_handlers: parseJson(r.allowed_handlers) as string[] | null,
+           config: (parseJson(r.config) as Record<string, any> | null) ?? {} } as ClientRow;
+}
+
+const SECRET_SUFFIXES = ["_secret", "_token", "_key", "_password"];
+
+export function maskConfig(cfg: Record<string, any> | null | undefined): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(cfg ?? {})) {
+    out[k] = v && SECRET_SUFFIXES.some((sfx) => k.endsWith(sfx)) ? "****" + String(v).slice(-4) : v;
+  }
+  return out;
+}
+
+export function clientView(c: ClientRow, monthJobs?: number) {
+  return {
+    id: c.id, slug: c.slug, name: c.name, active: c.active, plan: c.plan,
+    monthly_job_limit: effectiveLimit(c.plan, c.monthly_job_limit),
+    allowed_handlers: effectiveHandlers(c.plan, c.allowed_handlers),
+    outbound_webhook_url: c.outbound_webhook_url, config: maskConfig(c.config), agency_id: c.agency_id,
+    contact_email: c.contact_email, created_at: iso(c.created_at), ...(monthJobs !== undefined ? { month_jobs: monthJobs } : {}),
+  };
 }
 
 export interface JobView {
@@ -52,31 +90,119 @@ export function jobView(r: Record<string, any>): JobView {
 const JOB_COLS = "id, client_id, type, status, attempts, max_attempts, source, payload, result, error, created_at, run_at, started_at, finished_at";
 
 // ------------------------------------------------------------------ clients
-export async function createClient(db: Db, slug: string, name: string) {
+export interface NewClient {
+  plan?: string; monthly_job_limit?: number | null; allowed_handlers?: string[] | null; outbound_webhook_url?: string | null;
+  config?: Record<string, any> | null; agency_id?: string | null; contact_email?: string | null; stripe_customer_id?: string | null;
+}
+
+export async function createClient(db: Db, slug: string, name: string, o: NewClient = {}) {
   const apiKey = "ap_" + randomToken(32);
-  const row = { id: newId(), slug, name, webhook_secret: randomHex(32), api_key_hash: await sha256Hex(apiKey) };
-  await db.query(
-    `INSERT INTO clients (id, slug, name, api_key_hash, webhook_secret, active, created_at)
-     VALUES ($1, $2, $3, $4, $5, true, now())`,
-    [row.id, row.slug, row.name, row.api_key_hash, row.webhook_secret],
+  const id = newId(), webhook_secret = randomHex(32);
+  const rows = await db.query(
+    `INSERT INTO clients (id, slug, name, api_key_hash, webhook_secret, active, created_at, plan, monthly_job_limit,
+       allowed_handlers, outbound_webhook_url, config, agency_id, contact_email, stripe_customer_id)
+     VALUES ($1, $2, $3, $4, $5, true, now(), $6, $7, $8::json, $9, $10::json, $11, $12, $13) RETURNING ${CLIENT_COLS}`,
+    [id, slug, name, await sha256Hex(apiKey), webhook_secret, o.plan ?? DEFAULT_PLAN, o.monthly_job_limit ?? null,
+     o.allowed_handlers ? JSON.stringify(o.allowed_handlers) : null, o.outbound_webhook_url ?? null,
+     JSON.stringify(o.config ?? {}), o.agency_id ?? null, o.contact_email ?? null, o.stripe_customer_id ?? null],
   );
-  return { ...row, apiKey };
+  return { client: clientRow(rows[0]) as ClientRow, apiKey };
 }
 
 export async function clientByApiKey(db: Db, apiKey: string): Promise<ClientRow | null> {
-  const rows = await db.query<ClientRow>(
-    "SELECT id, slug, name, webhook_secret, active, created_at FROM clients WHERE api_key_hash = $1 AND active = true",
-    [await sha256Hex(apiKey)],
-  );
-  return rows[0] ?? null;
+  const rows = await db.query(`SELECT ${CLIENT_COLS} FROM clients WHERE api_key_hash = $1 AND active = true`, [await sha256Hex(apiKey)]);
+  return clientRow(rows[0]);
 }
 
 export async function clientBySlug(db: Db, slug: string): Promise<ClientRow | null> {
-  const rows = await db.query<ClientRow>(
-    "SELECT id, slug, name, webhook_secret, active, created_at FROM clients WHERE slug = $1 AND active = true",
-    [slug],
-  );
-  return rows[0] ?? null;
+  const rows = await db.query(`SELECT ${CLIENT_COLS} FROM clients WHERE slug = $1 AND active = true`, [slug]);
+  return clientRow(rows[0]);
+}
+
+export async function clientById(db: Db, id: string): Promise<ClientRow | null> {
+  return clientRow((await db.query(`SELECT ${CLIENT_COLS} FROM clients WHERE id = $1`, [id]))[0]);
+}
+
+export async function clientByStripeCustomer(db: Db, customerId: string): Promise<ClientRow | null> {
+  return clientRow((await db.query(`SELECT ${CLIENT_COLS} FROM clients WHERE stripe_customer_id = $1`, [customerId]))[0]);
+}
+
+const UPDATABLE = ["name", "plan", "monthly_job_limit", "allowed_handlers", "outbound_webhook_url", "config",
+  "contact_email", "active", "stripe_customer_id"];
+
+/** Partial update; `config` is merged key-by-key (null values delete keys), like repo.update_client in Python. */
+export async function updateClient(db: Db, id: string, fields: Record<string, any>): Promise<ClientRow | null> {
+  const current = await clientById(db, id);
+  if (!current) return null;
+  const sets: string[] = [];
+  const params: unknown[] = [id];
+  for (const [k, raw] of Object.entries(fields)) {
+    if (!UPDATABLE.includes(k) || raw === undefined) continue;
+    let v = raw;
+    if (k === "config") {
+      const merged: Record<string, any> = { ...(current.config ?? {}), ...(raw ?? {}) };
+      v = Object.fromEntries(Object.entries(merged).filter(([, x]) => x !== null));
+    }
+    const json = k === "config" || k === "allowed_handlers";
+    params.push(json ? (v === null ? null : JSON.stringify(v)) : v);
+    sets.push(`${k} = $${params.length}${json ? "::json" : ""}`);
+  }
+  if (!sets.length) return current;
+  return clientRow((await db.query(`UPDATE clients SET ${sets.join(", ")} WHERE id = $1 RETURNING ${CLIENT_COLS}`, params))[0]);
+}
+
+export async function subClients(db: Db, agencyId: string): Promise<ClientRow[]> {
+  const rows = await db.query(`SELECT ${CLIENT_COLS} FROM clients WHERE agency_id = $1 ORDER BY created_at`, [agencyId]);
+  return rows.map((r) => clientRow(r) as ClientRow);
+}
+
+export async function monthJobCounts(db: Db, ids: string[]): Promise<Record<string, number>> {
+  if (!ids.length) return {};
+  const rows = await db.query(
+    `SELECT client_id, count(*)::int AS n FROM jobs WHERE client_id = ANY($1::varchar[])
+       AND created_at >= date_trunc('month', now()) AND type NOT LIKE 'internal.%' GROUP BY client_id`, [ids]);
+  return Object.fromEntries(rows.map((r) => [r.client_id, Number(r.n)]));
+}
+
+export async function clientsForWeeklyReports(db: Db): Promise<string[]> {
+  const rows = await db.query(`SELECT id, config FROM clients WHERE active = true AND plan <> 'demo'`);
+  return rows.filter((r) => ((parseJson(r.config) as any) ?? {}).weekly_report !== false).map((r) => r.id as string);
+}
+
+/** Raw rows for the ROI report in ONE round trip (aggregated in products.ts, identically to Python). */
+export async function reportRows(db: Db, clientId: string, days: number) {
+  const [jobs, durations, usage] = await db.transaction([
+    { text: `SELECT type, status, created_at, finished_at, result FROM jobs
+             WHERE client_id = $1 AND created_at >= now() - make_interval(days => $2) LIMIT 20000`, params: [clientId, days] },
+    { text: `SELECT l.duration_ms FROM execution_logs l JOIN jobs j ON j.id = l.job_id
+             WHERE l.client_id = $1 AND l.created_at >= now() - make_interval(days => $2) AND l.status = 'succeeded'
+               AND j.type NOT LIKE 'internal.%' LIMIT 20000`, params: [clientId, days] },
+    { text: `SELECT job_id, provider, success, prompt_tokens, completion_tokens FROM api_usage
+             WHERE client_id = $1 AND created_at >= now() - make_interval(days => $2) LIMIT 50000`, params: [clientId, days] },
+  ]);
+  return {
+    jobs: jobs.map((r) => [r.type, r.status, r.created_at, r.finished_at, parseJson(r.result)] as [string, string, unknown, unknown, any]),
+    durations: durations.map((r) => Number(r.duration_ms)),
+    usage: usage.map((r) => [r.job_id, r.provider, Boolean(r.success), Number(r.prompt_tokens), Number(r.completion_tokens)] as
+      [string | null, string, boolean, number, number]),
+  };
+}
+
+/** Many jobs in one INSERT (delivery fan-out, weekly reports): one subrequest regardless of count. */
+export async function createJobsBulk(
+  db: Db, jobs: { type: string; payload: unknown; clientId: string | null; maxAttempts: number; source: string }[],
+): Promise<string[]> {
+  if (!jobs.length) return [];
+  const ids = jobs.map(() => newId());
+  const params: unknown[] = [];
+  const values = jobs.map((j, i) => {
+    params.push(ids[i], j.clientId, j.type, JSON.stringify(j.payload ?? {}), j.maxAttempts, j.source);
+    const b = params.length - 6;
+    return `($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}::json, 'queued', 0, $${b + 5}, $${b + 6}, now(), now())`;
+  });
+  await db.query(`INSERT INTO jobs (id, client_id, type, payload, status, attempts, max_attempts, source, created_at, run_at)
+                  VALUES ${values.join(", ")}`, params);
+  return ids;
 }
 
 export async function slugExists(db: Db, slug: string): Promise<boolean> {
@@ -84,8 +210,9 @@ export async function slugExists(db: Db, slug: string): Promise<boolean> {
 }
 
 export async function listClients(db: Db) {
-  const rows = await db.query("SELECT id, slug, name, active, created_at FROM clients ORDER BY created_at");
-  return rows.map((r) => ({ id: r.id, slug: r.slug, name: r.name, active: r.active, created_at: iso(r.created_at) }));
+  const rows = await db.query("SELECT id, slug, name, active, plan, agency_id, created_at FROM clients ORDER BY created_at");
+  return rows.map((r) => ({ id: r.id, slug: r.slug, name: r.name, active: r.active, plan: r.plan, agency_id: r.agency_id,
+                            created_at: iso(r.created_at) }));
 }
 
 export async function deactivateClient(db: Db, slug: string): Promise<boolean> {

@@ -10,6 +10,7 @@ from typing import Any
 from sqlalchemy import delete, func, select, text, update
 
 from db.session import session_scope
+from core.plans import DEFAULT_PLAN, effective_handlers, effective_limit
 from models import ApiUsage, Client, ExecutionLog, Job, JobStatus, WorkerHealth, utcnow
 
 
@@ -29,13 +30,110 @@ def job_to_dict(j: Job) -> dict[str, Any]:
 
 
 # ----------------------------------------------------------------- clients
-def create_client(slug: str, name: str) -> tuple[Client, str]:
+def create_client(slug: str, name: str, *, plan: str = DEFAULT_PLAN, monthly_job_limit: int | None = None,
+                  allowed_handlers: list[str] | None = None, outbound_webhook_url: str | None = None,
+                  config: dict | None = None, agency_id: str | None = None, contact_email: str | None = None,
+                  stripe_customer_id: str | None = None) -> tuple[Client, str]:
     api_key = "ap_" + secrets.token_urlsafe(32)
     with session_scope() as s:
-        c = Client(slug=slug, name=name, api_key_hash=hash_key(api_key),
-                   webhook_secret=secrets.token_hex(32))
+        c = Client(slug=slug, name=name, api_key_hash=hash_key(api_key), webhook_secret=secrets.token_hex(32),
+                   plan=plan, monthly_job_limit=monthly_job_limit, allowed_handlers=allowed_handlers,
+                   outbound_webhook_url=outbound_webhook_url, config=config or {}, agency_id=agency_id,
+                   contact_email=contact_email, stripe_customer_id=stripe_customer_id)
         s.add(c)
     return c, api_key
+
+
+SECRET_SUFFIXES = ("_secret", "_token", "_key", "_password")
+
+
+def mask_config(cfg: dict | None) -> dict:
+    out: dict[str, Any] = {}
+    for k, v in (cfg or {}).items():
+        out[k] = ("****" + str(v)[-4:]) if v and k.endswith(SECRET_SUFFIXES) else v
+    return out
+
+
+def client_view(c: Client, month_jobs: int | None = None) -> dict[str, Any]:
+    view = {"id": c.id, "slug": c.slug, "name": c.name, "active": c.active, "plan": c.plan,
+            "monthly_job_limit": effective_limit(c.plan, c.monthly_job_limit),
+            "allowed_handlers": effective_handlers(c.plan, c.allowed_handlers),
+            "outbound_webhook_url": c.outbound_webhook_url, "config": mask_config(c.config),
+            "agency_id": c.agency_id, "contact_email": c.contact_email,
+            "created_at": c.created_at.isoformat() if c.created_at else None}
+    if month_jobs is not None:
+        view["month_jobs"] = month_jobs
+    return view
+
+
+def client_by_id(client_id: str) -> Client | None:
+    with session_scope() as s:
+        return s.get(Client, client_id)
+
+
+def client_by_stripe_customer(customer_id: str) -> Client | None:
+    with session_scope() as s:
+        return s.scalar(select(Client).where(Client.stripe_customer_id == customer_id))
+
+
+def update_client(client_id: str, fields: dict[str, Any], merge_config: bool = True) -> Client | None:
+    allowed = {"name", "plan", "monthly_job_limit", "allowed_handlers", "outbound_webhook_url", "config",
+               "contact_email", "active", "stripe_customer_id"}
+    with session_scope() as s:
+        c = s.get(Client, client_id)
+        if c is None:
+            return None
+        for k, v in fields.items():
+            if k not in allowed:
+                continue
+            if k == "config" and merge_config:
+                merged = dict(c.config or {})
+                merged.update(v or {})
+                c.config = {kk: vv for kk, vv in merged.items() if vv is not None}
+            else:
+                setattr(c, k, v)
+        s.flush()
+        return c
+
+
+def sub_clients(agency_id: str) -> list[Client]:
+    with session_scope() as s:
+        return list(s.scalars(select(Client).where(Client.agency_id == agency_id).order_by(Client.created_at)))
+
+
+def month_job_counts(client_ids: list[str]) -> dict[str, int]:
+    if not client_ids:
+        return {}
+    now = utcnow()
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    with session_scope() as s:
+        rows = s.execute(select(Job.client_id, func.count()).where(
+            Job.client_id.in_(client_ids), Job.created_at >= month_start,
+            ~Job.type.like("internal.%")).group_by(Job.client_id)).all()
+    return {cid: int(n) for cid, n in rows}
+
+
+def clients_for_weekly_reports() -> list[str]:
+    with session_scope() as s:
+        rows = s.scalars(select(Client).where(Client.active.is_(True), Client.plan != "demo")).all()
+        return [c.id for c in rows if (c.config or {}).get("weekly_report", True)]
+
+
+def report_rows(client_id: str, days: int) -> dict[str, list]:
+    """Raw rows for the ROI report (aggregated in workers/products.py, identically to the Worker)."""
+    since = utcnow() - timedelta(days=days)
+    with session_scope() as s:
+        jobs = s.execute(select(Job.type, Job.status, Job.created_at, Job.finished_at, Job.result)
+                         .where(Job.client_id == client_id, Job.created_at >= since).limit(20000)).all()
+        durations = s.scalars(select(ExecutionLog.duration_ms).where(
+            ExecutionLog.client_id == client_id, ExecutionLog.created_at >= since,
+            ExecutionLog.status == JobStatus.SUCCEEDED, ~ExecutionLog.job_id.in_(
+                select(Job.id).where(Job.client_id == client_id, Job.type.like("internal.%")))).limit(20000)).all()
+        usage = s.execute(select(ApiUsage.job_id, ApiUsage.provider, ApiUsage.success, ApiUsage.prompt_tokens,
+                                 ApiUsage.completion_tokens).where(ApiUsage.client_id == client_id,
+                                                                   ApiUsage.created_at >= since).limit(50000)).all()
+    return {"since": since, "jobs": [tuple(r) for r in jobs], "durations": list(durations),
+            "usage": [tuple(r) for r in usage]}
 
 
 def client_by_api_key(api_key: str) -> Client | None:
@@ -51,8 +149,8 @@ def client_by_slug(slug: str) -> Client | None:
 
 def list_clients() -> list[dict[str, Any]]:
     with session_scope() as s:
-        return [{"id": c.id, "slug": c.slug, "name": c.name, "active": c.active,
-                 "created_at": c.created_at.isoformat()}
+        return [{"id": c.id, "slug": c.slug, "name": c.name, "active": c.active, "plan": c.plan,
+                 "agency_id": c.agency_id, "created_at": c.created_at.isoformat()}
                 for c in s.scalars(select(Client).order_by(Client.created_at))]
 
 

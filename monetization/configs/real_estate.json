@@ -1,0 +1,14 @@
+{
+  "business_name": "Atlas Living Real Estate",
+  "business_description": "Boutique agency selling apartments and villas in Casablanca and Rabat (1M-8M MAD).",
+  "tone": "warm, concise, professional",
+  "booking_url": "https://cal.com/atlas-living/visit",
+  "notify_url": "https://hooks.slack.com/services/T000/B000/XXXX",
+  "lead": {
+    "ideal_customer": "Buyers with budget above 1.5M MAD planning to buy within 3 months",
+    "hot_threshold": 70,
+    "warm_threshold": 40
+  },
+  "hourly_rate_usd": 20,
+  "minutes_saved": {"lead_qualifier": 6}
+}

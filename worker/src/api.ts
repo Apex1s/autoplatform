@@ -2,115 +2,17 @@
 // so clients, scripts/e2e_smoke.py and both runtimes are interchangeable.
 import type { Deps } from "./deps";
 import { configWarnings } from "./env";
-import { clientJobTypes, HANDLERS, SYSTEM_PREFIX } from "./handlers";
+import { admit, baseUrl, checkHandlers, checkHttps, credentials, enqueue, readJson, requireAdmin, requireClient, requireCron,
+  type Ctx, type Route, type RouteEntry, validateTask } from "./http";
+import { CORS_HEADERS, MONETIZATION_ROUTES } from "./monetization";
+import { DEFAULT_PLAN, PLANS, RESERVED_SLUGS } from "./plans";
+import { clientJobTypes, isClientCallable } from "./registry";
 import * as repo from "./repo";
-import { drain } from "./runner";
-import { bearer, HttpError, hmacSha256Hex, json, newId, safeEqual } from "./util";
+import { bearer, HttpError, json, safeEqual } from "./util";
 
-export const VERSION = "1.1.0";
-const API_KEY_RE = /^ap_[A-Za-z0-9_-]{43}$/;
-const SIG_RE = /^[0-9a-f]{64}$/i;
+export const VERSION = "1.2.0";
 let healthCache: { at: number; status: number; body: unknown } | null = null;
 
-type Ctx = Pick<ExecutionContext, "waitUntil">;
-type Route = (req: Request, deps: Deps, ctx: Ctx, params: string[]) => Promise<Response>;
-
-// ------------------------------------------------------------------ helpers
-async function readBody(req: Request, max: number): Promise<Uint8Array> {
-  const declared = Number(req.headers.get("content-length") ?? "");
-  if (declared > max) throw new HttpError(413, "payload too large");
-  if (!req.body) return new Uint8Array();
-  const reader = req.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    size += value.byteLength;
-    if (size > max) {
-      await reader.cancel();
-      throw new HttpError(413, "payload too large");
-    }
-    chunks.push(value);
-  }
-  const out = new Uint8Array(size);
-  let off = 0;
-  for (const c of chunks) {
-    out.set(c, off);
-    off += c.byteLength;
-  }
-  return out;
-}
-
-async function readJson(req: Request, deps: Deps): Promise<any> {
-  const raw = await readBody(req, deps.cfg.maxBodyBytes);
-  try {
-    return JSON.parse(new TextDecoder().decode(raw) || "null");
-  } catch {
-    throw new HttpError(422, "body must be valid JSON");
-  }
-}
-
-const baseUrl = (req: Request, deps: Deps) => deps.cfg.publicBaseUrl || new URL(req.url).origin;
-
-function requireAdmin(req: Request, deps: Deps): void {
-  if (!deps.cfg.adminToken) throw new HttpError(503, "ADMIN_TOKEN not configured");
-  if (!safeEqual(bearer(req), deps.cfg.adminToken)) throw new HttpError(401, "invalid admin token");
-}
-
-function requireCron(req: Request, deps: Deps): void {
-  const { cronToken, adminToken } = deps.cfg;
-  if (!cronToken) throw new HttpError(503, "CRON_TOKEN/ADMIN_TOKEN not configured");
-  const t = bearer(req);
-  if (!t || !(safeEqual(t, cronToken) || (adminToken !== "" && safeEqual(t, adminToken)))) {
-    throw new HttpError(401, "invalid cron token");
-  }
-}
-
-async function requireClient(req: Request, deps: Deps): Promise<repo.ClientRow> {
-  const key = req.headers.get("x-api-key");
-  if (!key) throw new HttpError(401, "missing X-API-Key");
-  if (!API_KEY_RE.test(key)) throw new HttpError(401, "invalid API key"); // no DB round trip for junk
-  const c = await repo.clientByApiKey(deps.db, key);
-  if (!c) throw new HttpError(401, "invalid API key");
-  return c;
-}
-
-function validateTask(body: any): { type: string; payload: Record<string, unknown>; maxAttempts: number | null; delayS: number } {
-  if (!body || typeof body !== "object" || Array.isArray(body)) throw new HttpError(422, "body must be a JSON object");
-  if (typeof body.type !== "string" || !body.type) throw new HttpError(422, "'type' is required");
-  const payload = body.payload ?? {};
-  if (typeof payload !== "object" || Array.isArray(payload)) throw new HttpError(422, "'payload' must be an object");
-  const ma = body.max_attempts ?? null;
-  if (ma !== null && !(Number.isInteger(ma) && ma >= 1 && ma <= 10)) throw new HttpError(422, "'max_attempts' must be 1..10");
-  const delay = body.delay_seconds ?? 0;
-  if (!(Number.isInteger(delay) && delay >= 0 && delay <= 7 * 86400)) throw new HttpError(422, "'delay_seconds' must be 0..604800");
-  return { type: body.type, payload, maxAttempts: ma, delayS: delay };
-}
-
-/** Insert + enqueue, then (after the response) run queued work right away. */
-async function enqueue(
-  req: Request, deps: Deps, ctx: Ctx, type: string, payload: unknown,
-  o: { clientId: string | null; source: string; maxAttempts?: number | null; delayS?: number; idemKey?: string | null },
-) {
-  const id = newId();
-  const statusUrl = (jid: string) => `${baseUrl(req, deps)}/tasks/${jid}`;
-  if (o.idemKey) {
-    const existing = await deps.queue.claimIdempotency(`${o.clientId ?? "system"}:${o.idemKey}`, id);
-    if (existing) return { job_id: existing, status: "duplicate", duplicate: true, status_url: statusUrl(existing) };
-  }
-  await repo.createJob(deps.db, type, payload, {
-    id, clientId: o.clientId, maxAttempts: o.maxAttempts ?? deps.cfg.jobMaxAttempts, source: o.source, delayS: o.delayS ?? 0,
-  });
-  try {
-    await deps.queue.enqueue(id, o.delayS ?? 0);
-  } catch (e) {
-    // row stays queued; maintenance re-enqueues it once Redis is reachable
-    console.error(`enqueue failed for ${id}; maintenance will recover it`, e);
-  }
-  if (!o.delayS) ctx.waitUntil(drain(deps, { maxJobs: 2, deadline: Date.now() + 25_000 }).catch((e) => console.error("inline drain", e)));
-  return { job_id: id, status: "queued", type, status_url: statusUrl(id) };
-}
 
 // ------------------------------------------------------------------- routes
 const root: Route = async () =>
@@ -196,13 +98,14 @@ const metrics: Route = async (req, deps) => {
 const postTask: Route = async (req, deps, ctx) => {
   const client = await requireClient(req, deps);
   const t = validateTask(await readJson(req, deps));
-  if (!(t.type in HANDLERS) || t.type.startsWith(SYSTEM_PREFIX)) {
-    throw new HttpError(422, `unknown job type; allowed: ${JSON.stringify(clientJobTypes())}`);
-  }
-  return json(await enqueue(req, deps, ctx, t.type, t.payload, {
+  if (!isClientCallable(t.type)) throw new HttpError(422, `unknown job type; allowed: ${JSON.stringify(clientJobTypes())}`);
+  await admit(deps, client, t.type);
+  const out: Record<string, unknown> = await enqueue(req, deps, ctx, t.type, t.payload, {
     clientId: client.id, source: "webhook", maxAttempts: t.maxAttempts, delayS: t.delayS,
     idemKey: req.headers.get("idempotency-key"),
-  }), 202);
+  });
+  if (out.duplicate) await deps.queue.quotaDecr(client.id);
+  return json(out, 202);
 };
 
 const getTask: Route = async (req, deps, _ctx, [id]) => {
@@ -216,26 +119,6 @@ const listTasks: Route = async (req, deps) => {
   const client = await requireClient(req, deps);
   const limit = Math.max(1, Math.min(Number(new URL(req.url).searchParams.get("limit") ?? 50) || 50, 200));
   return json(await repo.listJobs(deps.db, client.id, limit));
-};
-
-const signedWebhook: Route = async (req, deps, ctx, [slug]) => {
-  const sig = (req.headers.get("x-signature-256") ?? req.headers.get("x-hub-signature-256") ?? "").replace(/^sha256=/, "");
-  const raw = await readBody(req, deps.cfg.maxBodyBytes);
-  if (!SIG_RE.test(sig)) throw new HttpError(401, "invalid signature"); // no DB round trip for junk
-  const client = await repo.clientBySlug(deps.db, slug);
-  if (!client) throw new HttpError(401, "invalid signature");
-  if (!safeEqual(sig, await hmacSha256Hex(client.webhook_secret, raw))) throw new HttpError(401, "invalid signature");
-  let body: unknown;
-  try {
-    body = JSON.parse(new TextDecoder().decode(raw));
-  } catch {
-    body = { raw: new TextDecoder().decode(raw).slice(0, 10000) };
-  }
-  const event = req.headers.get("x-event-type") ?? req.headers.get("x-github-event");
-  return json(await enqueue(req, deps, ctx, "webhook.event", { event, body }, {
-    clientId: client.id, source: "signed_webhook",
-    idemKey: req.headers.get("idempotency-key") ?? req.headers.get("x-github-delivery"),
-  }), 202);
 };
 
 const CRON_JOBS: Record<string, string> = { maintenance: "system.maintenance", provider_probe: "system.provider_probe" };
@@ -264,13 +147,22 @@ const createClient: Route = async (req, deps) => {
   const body = await readJson(req, deps);
   const slug = body?.slug, name = body?.name;
   if (typeof slug !== "string" || !/^[a-z0-9][a-z0-9-]{2,39}$/.test(slug)) throw new HttpError(422, "invalid slug");
+  if (RESERVED_SLUGS.has(slug)) throw new HttpError(422, "slug is reserved");
   if (typeof name !== "string" || !name.length || name.length > 200) throw new HttpError(422, "invalid name");
+  const planName = body.plan ?? DEFAULT_PLAN;
+  if (!(planName in PLANS)) throw new HttpError(422, `unknown plan; available: ${JSON.stringify(Object.keys(PLANS).sort())}`);
+  const limit = body.monthly_job_limit ?? null;
+  if (limit !== null && !(Number.isInteger(limit) && limit >= 0 && limit <= 10_000_000)) throw new HttpError(422, "invalid monthly_job_limit");
+  if (body.config !== undefined && body.config !== null && (typeof body.config !== "object" || Array.isArray(body.config))) {
+    throw new HttpError(422, "config must be an object");
+  }
   if (await repo.slugExists(deps.db, slug)) throw new HttpError(409, "slug already exists");
-  const c = await repo.createClient(deps.db, slug, name);
-  const base = baseUrl(req, deps);
-  return json({ id: c.id, slug: c.slug, name: c.name, api_key: c.apiKey, webhook_secret: c.webhook_secret,
-    webhook_url: `${base}/webhook`, signed_webhook_url: `${base}/webhook/${c.slug}`,
-    note: "api_key is shown once; store it now." }, 201);
+  const { client, apiKey } = await repo.createClient(deps.db, slug, name, {
+    plan: planName, monthly_job_limit: limit, allowed_handlers: checkHandlers(body.allowed_handlers),
+    outbound_webhook_url: checkHttps(body.outbound_webhook_url), config: body.config ?? {},
+    contact_email: typeof body.contact_email === "string" ? body.contact_email.slice(0, 200) : null,
+  });
+  return json(credentials(client, apiKey, baseUrl(req, deps)), 201);
 };
 
 const listClients: Route = async (req, deps) => {
@@ -284,7 +176,8 @@ const deactivateClient: Route = async (req, deps, _ctx, [slug]) => {
   return json({ slug, active: false });
 };
 
-const ROUTES: [string, RegExp, Route][] = [
+const ROUTES: RouteEntry[] = [
+  ...MONETIZATION_ROUTES,
   ["GET", /^\/$/, root],
   ["GET", /^\/livez$/, livez],
   ["GET", /^\/healthz$/, healthz],
@@ -293,7 +186,6 @@ const ROUTES: [string, RegExp, Route][] = [
   ["POST", /^\/tasks$/, postTask],
   ["GET", /^\/tasks$/, listTasks],
   ["GET", /^\/tasks\/([A-Za-z0-9]{1,64})$/, getTask],
-  ["POST", /^\/webhook\/([a-z0-9-]{1,40})$/, signedWebhook],
   ["POST", /^\/cron\/([a-z_]{1,40})$/, cron],
   ["GET", /^\/cron\/jobs\/([A-Za-z0-9]{1,64})$/, cronJob],
   ["POST", /^\/admin\/clients$/, createClient],
@@ -303,6 +195,17 @@ const ROUTES: [string, RegExp, Route][] = [
 
 export async function handle(req: Request, deps: Deps, ctx: Ctx): Promise<Response> {
   const path = new URL(req.url).pathname;
+  if (path.startsWith("/demo")) {
+    if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
+    const res = await route(req, deps, ctx, path);
+    const out = new Response(res.body, res);
+    for (const [k, v] of Object.entries(CORS_HEADERS)) out.headers.set(k, v);
+    return out;
+  }
+  return route(req, deps, ctx, path);
+}
+
+async function route(req: Request, deps: Deps, ctx: Ctx, path: string): Promise<Response> {
   try {
     // like the FastAPI BodySizeLimit middleware: reject oversized bodies before auth or routing
     if (Number(req.headers.get("content-length") ?? "") > deps.cfg.maxBodyBytes) throw new HttpError(413, "payload too large");

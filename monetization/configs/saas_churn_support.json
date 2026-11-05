@@ -1,0 +1,20 @@
+{
+  "business_name": "Pulse Analytics",
+  "stripe_webhook_secret": "whsec_from_your_stripe_dashboard",
+  "notify_url": "https://discord.com/api/webhooks/000/XXXX",
+  "churn": {
+    "product_name": "Pulse Analytics",
+    "founder_name": "Sami",
+    "max_discount_percent": 30,
+    "allowed_offers": ["discount", "pause", "downgrade"],
+    "billing_portal_url": "https://billing.stripe.com/p/login/XXXX"
+  },
+  "support": {
+    "categories": ["billing", "technical", "account", "sales", "feedback", "other"],
+    "routing": {"billing": "finance@pulse.example", "technical": "tier2@pulse.example", "default": "support@pulse.example"},
+    "sla_minutes": {"critical": 15, "high": 60, "normal": 240, "low": 1440},
+    "policy": "Refunds only within 14 days of a charge; never promise credits."
+  },
+  "llm_providers": ["groq"],
+  "hourly_rate_usd": 35
+}

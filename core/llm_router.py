@@ -199,7 +199,8 @@ class LLMRouter:
 
     # ------------------------------------------------------------ one call
     async def _call(self, p: ProviderConfig, messages: list[dict], max_tokens: int,
-                    temperature: float, model: str | None) -> LLMResult:
+                    temperature: float, model: str | None,
+                    extra: dict[str, Any] | None = None) -> LLMResult:
         model = model or p.model
         st = self.stats[p.name]
         st.requests += 1
@@ -209,7 +210,7 @@ class LLMRouter:
                 f"{p.base_url.rstrip('/')}/chat/completions",
                 headers={"Authorization": f"Bearer {p.api_key}"},
                 json={"model": model, "messages": messages,
-                      "max_tokens": max_tokens, "temperature": temperature},
+                      "max_tokens": max_tokens, "temperature": temperature, **(extra or {})},
                 timeout=p.timeout,
             )
         except httpx.TimeoutException as e:
@@ -256,13 +257,27 @@ class LLMRouter:
         only: list[str] | None = None,
         client_id: str | None = None,
         job_id: str | None = None,
+        response_format: dict[str, Any] | None = None,
+        simulate_failure: str | None = None,
     ) -> LLMResult:
+        """`response_format={"type": "json_object"}` enables JSON mode on both providers.
+        `simulate_failure="groq"` (demo only) records a labelled synthetic 429 for that provider
+        instead of calling it, so failover can be shown live; real cooldowns are untouched."""
         pool = [p for p in self.providers if not only or p.name in only]
         if not pool:
             raise AllProvidersFailed([])
         models = models or {}
+        extra = {"response_format": response_format} if response_format else None
         errors: list[ProviderError] = []
         attempts: list[dict[str, Any]] = []
+        if simulate_failure and any(p.name == simulate_failure for p in pool) and len(pool) > 1:
+            rec = {"provider": simulate_failure, "model": "-", "client_id": client_id, "job_id": job_id,
+                   "round": 0, "retry": 0, "success": False, "status_code": 429,
+                   "error_kind": "rate_limit", "simulated": True, "prompt_tokens": 0,
+                   "completion_tokens": 0, "latency_ms": 0}
+            attempts.append(rec)
+            errors.append(ProviderError(simulate_failure, "rate_limit", "simulated outage (demo)", 429))
+            pool = [p for p in pool if p.name != simulate_failure]
 
         for rnd in range(self.max_rounds):
             ready = [p for p in pool if self.cooldown_remaining(p.name) == 0]
@@ -277,7 +292,7 @@ class LLMRouter:
                     base = {"provider": p.name, "model": models.get(p.name, p.model),
                             "client_id": client_id, "job_id": job_id, "round": rnd, "retry": retry}
                     try:
-                        res = await self._call(p, messages, max_tokens, temperature, models.get(p.name))
+                        res = await self._call(p, messages, max_tokens, temperature, models.get(p.name), extra)
                     except ProviderError as e:
                         st = self.stats[p.name]
                         st.failures += 1

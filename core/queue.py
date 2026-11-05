@@ -123,6 +123,44 @@ class TaskQueue:
         return {"pending": int(await self.r.llen(self.pending)),
                 "delayed": int(await self.r.zcard(self.delayed))}
 
+    # ------------------------------------------- quotas, rate limits, one-time secrets
+    def _quota_key(self, client_id: str) -> str:
+        return f"{self.prefix}:quota:{client_id}:{time.strftime('%Y%m', time.gmtime())}"
+
+    async def quota_incr(self, client_id: str) -> int:
+        """Month-to-date job counter (same key as the Worker). One INCR per accepted webhook."""
+        key = self._quota_key(client_id)
+        n = int(await self.r.incr(key))
+        if n == 1:
+            await self.r.expire(key, 40 * 86400)
+        return n
+
+    async def quota_decr(self, client_id: str) -> None:
+        await self.r.decr(self._quota_key(client_id))
+
+    async def quota_get(self, client_id: str) -> int:
+        return int(await self.r.get(self._quota_key(client_id)) or 0)
+
+    async def over_rate(self, key: str, window_s: int, limit: int) -> bool:
+        k = f"{self.prefix}:rl:{key}"
+        n = int(await self.r.incr(k))
+        if n == 1:
+            await self.r.expire(k, window_s)
+        return n > limit
+
+    async def put_secret(self, key: str, value: str, ttl: int) -> None:
+        await self.r.set(f"{self.prefix}:secret:{key}", value, ex=ttl)
+
+    async def peek_secret(self, key: str) -> str | None:
+        return await self.r.get(f"{self.prefix}:secret:{key}")
+
+    async def release_idempotency(self, key: str) -> None:
+        await self.r.delete(f"{self.prefix}:idem:{key}")
+
+    async def take_secret(self, key: str) -> str | None:
+        """Read-once (GETDEL): onboarding credentials are revealed a single time."""
+        return await self.r.getdel(f"{self.prefix}:secret:{key}")
+
     # ------------------------------------------------------- worker liveness
     async def register_worker(self, worker_id: str) -> None:
         await self.r.sadd(self.workers_key, worker_id)
