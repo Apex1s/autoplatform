@@ -79,12 +79,49 @@ Every push to `main` redeploys through Cloudflare's Git integration. The schema 
 | GET | `/cron/jobs/{job_id}` | `Bearer CRON_TOKEN` | Status of a system job |
 | POST/GET | `/admin/clients` | `Bearer ADMIN_TOKEN` | Create a client (returns `api_key` and `webhook_secret` once) or list clients |
 | DELETE | `/admin/clients/{slug}` | `Bearer ADMIN_TOKEN` | Deactivate a client (revokes its API key) |
+| PATCH | `/admin/clients/{slug}` · GET `/admin/clients/{slug}/usage` | `Bearer ADMIN_TOKEN` | Change plan, limits, handlers, outbound URL or config · ROI report |
+| GET/PATCH | `/me` · GET `/usage?days=7` | `X-API-Key` | Self-serve profile, quota, endpoints and config · ROI report |
+| POST/GET/PATCH/DELETE | `/agency/clients[/{slug}]` · GET `/agency/usage` | `X-API-Key` (agency plan) | White-label sub-clients and their usage |
+| POST | `/webhook/{slug}/{handler}` | Stripe / Typeform / Shopify / HMAC signature | Signed ingest straight into a handler (GET answers Meta's `hub.challenge`) |
+| POST | `/webhook/stripe` · GET `/billing/welcome` | Stripe signature · session id | Auto-provisioning on payment · read-once credentials |
+| GET/POST | `/demo` · `/demo/run` · `/demo/jobs/{id}` | none (rate-limited) | Live demo page and API |
+| POST | `/cron/weekly_reports` | `Bearer CRON_TOKEN` | Queue every client's weekly ROI report |
 
 **Job types:**
-- `echo`
-- `llm.complete`: `{prompt | messages, system?, max_tokens?}`
-- `http.fetch`: `{url, params?, summarize?}`. Public HTTPS APIs only, e.g. from [public-apis](https://github.com/public-apis/public-apis); private addresses are blocked, redirects aren't followed, and responses are capped at 512 KB.
-- `webhook.event`
+- Revenue handlers (`workers/products.py` and `worker/src/products.ts`, identical behaviour):
+  - `lead_qualifier`: extracts the lead's details and scores intent and fit 0–100 (the tier comes from your thresholds). It recovers contact details from the raw payload, drafts a WhatsApp and an email reply, and delivers to your CRM.
+  - `whatsapp_order_triage`: accepts Meta WhatsApp Cloud API or any message JSON. Items are matched to *your* catalog and prices and totals are computed in code, never by the model. Sends a multilingual confirmation.
+  - `stripe_churn_rescuer`: takes Stripe-signed events. Offers are kept within your guardrails (allowed list, discount cap, payment update for failed payments), with a founder-voice email.
+  - `support_ticket_router`: category, urgency and sentiment, plus routing, an SLA due time, escalation and a suggested reply.
+  - `usage_reporter`: the weekly ROI digest (volume, time-to-result, failover saves, deliveries, highlights, hours and $ saved). It runs automatically on Mondays at 08:17 UTC.
+- Utilities:
+  - `echo`
+  - `llm.complete`
+  - `webhook.event`
+  - `http.fetch`: public HTTPS APIs only; private and internal addresses are blocked.
+
+All LLM output is strict JSON: JSON mode on both providers, schema coercion, and one repair round. Results reach your CRM through HMAC-signed `internal.deliver` jobs with their own retries (8 attempts over about 35 minutes), so a down CRM never re-runs the AI. Slack and Discord URLs get readable summaries.
+
+**Monetization layer:**
+- **Plans and limits:** `retainer`, `agency`, `agency_client`, `guard_starter`, `guard_pro`, `demo`, each with monthly quotas and handler allow-lists.
+- **Self-serve:** `/me`, `/usage`.
+- **Agencies:** `/agency/clients`, `/agency/usage`.
+- **Signed ingest per handler:** `/webhook/{slug}/{handler}` verifies Stripe, Typeform, Shopify and HMAC signatures, and handles Meta's `hub.challenge`.
+- **Stripe auto-provisioning:** `POST /webhook/stripe`, with a credentials page that shows them once.
+- **Live demo:** `/demo`.
+
+Go-to-market material lives in `monetization/`:
+- `gtm/offer_architecture.md`: offers, SLA wording, costs, and the Zapier/Make calculator.
+- `gtm/outbound_playbooks.md`: five outreach sequences.
+- `gtm/stripe_checkout_setup.md`: self-serve billing setup.
+- `configs/`: per-vertical client config templates.
+- `demo/index.html`: the demo page.
+
+```bash
+python -m scripts.provision_client --api https://<host> --admin-token "$ADMIN_TOKEN" --slug acme --name "Acme" \
+  --plan retainer --handlers lead_qualifier --outbound https://crm.example.com/hook --config monetization/configs/real_estate.json
+python -m scripts.simulate_stripe --url https://<host> --secret "$STRIPE_WEBHOOK_SECRET" --plan guard_pro   # test billing without Stripe
+```
 
 ## Failover policy
 
@@ -114,14 +151,14 @@ Throughput: jobs run right after the webhook response, and the cron drains up to
 ```bash
 # Python runtime
 python -m venv .venv && . .venv/bin/activate && pip install -r requirements-dev.txt
-python -m pytest -q                       # 84 hermetic tests (never read .env)
+python -m pytest -q                       # 102 hermetic tests (never read .env)
 TEST_DATABASE_URL=postgresql://... TEST_REDIS_URL=redis://... python -m pytest -q
 uvicorn app.main:app --port 7860
 
 # Worker runtime
 cd worker && npm ci
-npx tsc --noEmit && npx vitest run        # 35 unit tests (+17 integration with TEST_DATABASE_URL / TEST_REDIS_URL)
-NODE_USE_ENV_PROXY=1 npx tsx scripts/live.ts   # run the Worker in Node against the real services in ../.env
+npx tsc --noEmit && npx vitest run        # 68 tests (integration parts need TEST_DATABASE_URL / TEST_REDIS_URL)
+NODE_USE_ENV_PROXY=1 npm run live         # run the Worker in Node against the real services in ../.env
 npx wrangler deploy --dry-run --outdir dist    # bundle exactly what Cloudflare deploys
 ```
 
@@ -141,5 +178,6 @@ npx wrangler deploy --dry-run --outdir dist    # bundle exactly what Cloudflare 
 - Postgres is the source of truth. Claiming a job is one atomic `UPDATE … WHERE status IN (queued, retrying)`, so delivery is at least once and duplicate queue entries are harmless. Handlers should be idempotent.
 - Idempotency keys are claimed in Redis **before** the job row is written, so duplicates leave no extra rows.
 - If a run dies mid-job (an invocation limit, a deploy), the job stays `running` until its lease runs out (3 × `JOB_TIMEOUT_SECONDS`). Maintenance then puts it back in the queue. Jobs whose ID never reached Redis are re-enqueued after 10 minutes.
+- Cloudflare's edge bot filter rejects Python's built-in `urllib` user agent with 403 before the Worker runs. Use `requests`/`httpx` or set a User-Agent (all webhook senders tested pass).
 - `/healthz` reports the backends actually in use and any missing configuration. A deploy without its secrets shows `degraded` with reasons instead of looking healthy.
 - The Python runtime adds a resident worker (one blocking `BLMOVE` poller, N concurrent jobs, Redis heartbeats, dead-worker reaping). See `workers/worker.py`.

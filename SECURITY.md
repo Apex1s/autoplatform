@@ -35,6 +35,22 @@ on the host (Render) and as encrypted GitHub Actions secrets. `.env`, `.env.*` (
   networks, which covers DNS-rebinding tricks.
 - Secrets live only in Cloudflare's encrypted secret store (dashboard → Variables and Secrets).
 
+## Monetization surfaces (v1.2)
+- **Outbound deliveries** (`internal.deliver`) are signed with
+  `X-AutoPlatform-Signature: sha256=<hmac(client webhook_secret, raw body)>`. Destination URLs must be
+  https with no credentials, and private addresses are refused at send time. Redirects are not followed.
+- **Inbound signatures per handler:**
+  - Stripe uses `t=,v1=` with a 5-minute replay window.
+  - Typeform and Shopify use base64 HMAC.
+  - GitHub, Meta and our own format use hex HMAC.
+  - All comparisons are constant-time, and malformed signatures are rejected before any database lookup.
+- **Platform Stripe webhook** (`/webhook/stripe`): signature-verified and idempotent per event id. Provisioned
+  credentials are kept readable only until the first reveal (Redis `GETDEL`, 7-day TTL); only the API key hash is stored.
+- **Secrets in client config** (`*_secret`, `*_token`, `*_key`) are masked in every API view (`****1234`).
+- **The public demo** is rate-limited per IP and per day, runs only on the `demo` client, and never delivers outbound.
+  Its simulated LLM outage is labelled as such and never recorded as provider usage.
+- **Plans** enforce handler allow-lists and monthly quotas before a job is created.
+
 ## Rotating credentials
 1. Generate the new key in the provider's dashboard (Groq, Google AI Studio, Upstash, Neon).
 2. Update it in Cloudflare → Workers → autoplatform → Settings → Variables and Secrets (and in
