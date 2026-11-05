@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import re
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -23,7 +24,8 @@ from models import Client
 from workers.handlers import HANDLERS, SYSTEM_PREFIX, client_job_types
 from workers.worker import Worker
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+API_KEY_RE = re.compile(r"ap_[A-Za-z0-9_-]{43}")
 log = logging.getLogger("autoplatform.api")
 
 
@@ -137,6 +139,8 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
     async def require_client(x_api_key: str | None = Header(default=None)) -> Client:
         if not x_api_key:
             raise HTTPException(401, "missing X-API-Key")
+        if not API_KEY_RE.fullmatch(x_api_key):
+            raise HTTPException(401, "invalid API key")  # no DB round trip for junk
         c = await asyncio.to_thread(repo.client_by_api_key, x_api_key)
         if c is None:
             raise HTTPException(401, "invalid API key")

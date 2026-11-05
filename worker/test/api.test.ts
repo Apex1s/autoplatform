@@ -246,6 +246,27 @@ describe.skipIf(!HAVE_INFRA)("worker API (Postgres + Redis)", () => {
     expect(j.body.llm_usage_24h.length).toBeGreaterThan(0);
   });
 
+  it("public-endpoint guards: junk keys/signatures never reach the DB; healthz is cached", async () => {
+    let queries = 0;
+    const counting = (env = {}) => {
+      const d = infra.deps(env);
+      const inner = d.db;
+      d.db = { query: (t, p) => (queries++, inner.query(t, p)), transaction: (s) => (queries++, inner.transaction(s)) };
+      return d;
+    };
+    const run = async (r: Request, env = {}) => handle(r, counting(env), new TestCtx());
+    expect((await run(req("POST", "/webhook", { body: { type: "echo" }, headers: { "x-api-key": "ap_short" } }))).status).toBe(401);
+    expect((await run(req("GET", "/tasks", { headers: { "x-api-key": "x".repeat(46) } }))).status).toBe(401);
+    expect((await run(req("POST", "/webhook/acme", { raw: "{}", headers: { "x-signature-256": "sha256=nothex" } }))).status).toBe(401);
+    expect(queries).toBe(0);
+    const first = await run(req("GET", "/healthz"), { HEALTHZ_CACHE_SECONDS: "15" });
+    const before = queries;
+    const second = await run(req("GET", "/healthz"), { HEALTHZ_CACHE_SECONDS: "15" });
+    expect(second.headers.get("x-cache")).toBe("hit");
+    expect(queries).toBe(before);
+    expect(await second.json()).toEqual(await first.json());
+  });
+
   it("unknown routes and methods", async () => {
     expect((await call(req("GET", "/nope"))).res.status).toBe(404);
     expect((await call(req("PUT", "/webhook"))).res.status).toBe(405);

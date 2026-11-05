@@ -27,7 +27,7 @@ jobs:
       contents: read
       actions: write   # only to reset GitHub's 60-day inactivity timer for this schedule
     env:
-      PLATFORM_URL: ${{ vars.PLATFORM_URL || '' }}
+      PLATFORM_URL: ${{ vars.PLATFORM_URL || 'https://autoplatform.data-marketplace-edge.workers.dev' }}
     steps:
       - name: Check /healthz
         id: health

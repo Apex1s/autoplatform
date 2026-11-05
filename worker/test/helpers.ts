@@ -95,6 +95,7 @@ export const baseEnv: Env = {
   CRON_TOKEN: "test-cron",
   APP_ENV: "development",
   JOB_RETRY_BASE_SECONDS: "0.05",
+  HEALTHZ_CACHE_SECONDS: "0",
 };
 
 export interface Infra {

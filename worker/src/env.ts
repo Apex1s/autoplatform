@@ -28,6 +28,7 @@ export interface Env {
   LOG_RETENTION_DAYS?: string;
   MAX_BODY_BYTES?: string;
   SUBREQUEST_BUDGET?: string;
+  HEALTHZ_CACHE_SECONDS?: string;
 }
 
 export interface Config {
@@ -59,6 +60,7 @@ export interface Config {
   logRetentionDays: number;
   maxBodyBytes: number;
   subrequestBudget: number;
+  healthzCacheS: number;
 }
 
 const str = (v: string | undefined, d = "") => (v ?? "").trim() || d;
@@ -117,6 +119,8 @@ export function loadConfig(env: Env): Config {
     maxBodyBytes: num(env.MAX_BODY_BYTES, 1_000_000),
     // Workers Free allows 50 subrequests per invocation; keep a margin.
     subrequestBudget: num(env.SUBREQUEST_BUDGET, 45),
+    // public endpoint: don't let /healthz spam wake Neon on every request
+    healthzCacheS: num(env.HEALTHZ_CACHE_SECONDS, 15),
   };
 }
 

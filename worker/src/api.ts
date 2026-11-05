@@ -7,7 +7,10 @@ import * as repo from "./repo";
 import { drain } from "./runner";
 import { bearer, HttpError, hmacSha256Hex, json, newId, safeEqual } from "./util";
 
-export const VERSION = "1.0.0";
+export const VERSION = "1.1.0";
+const API_KEY_RE = /^ap_[A-Za-z0-9_-]{43}$/;
+const SIG_RE = /^[0-9a-f]{64}$/i;
+let healthCache: { at: number; status: number; body: unknown } | null = null;
 
 type Ctx = Pick<ExecutionContext, "waitUntil">;
 type Route = (req: Request, deps: Deps, ctx: Ctx, params: string[]) => Promise<Response>;
@@ -67,6 +70,7 @@ function requireCron(req: Request, deps: Deps): void {
 async function requireClient(req: Request, deps: Deps): Promise<repo.ClientRow> {
   const key = req.headers.get("x-api-key");
   if (!key) throw new HttpError(401, "missing X-API-Key");
+  if (!API_KEY_RE.test(key)) throw new HttpError(401, "invalid API key"); // no DB round trip for junk
   const c = await repo.clientByApiKey(deps.db, key);
   if (!c) throw new HttpError(401, "invalid API key");
   return c;
@@ -116,6 +120,10 @@ const root: Route = async () =>
 const livez: Route = async () => json({ status: "alive" });
 
 const healthz: Route = async (_req, deps) => {
+  const ttlMs = deps.cfg.healthzCacheS * 1000;
+  if (ttlMs > 0 && healthCache && Date.now() - healthCache.at < ttlMs) {
+    return json(healthCache.body, healthCache.status, { "x-cache": "hit" });
+  }
   const checks: Record<string, unknown> = {};
   const settle = async (name: string, fn: () => Promise<boolean>) => {
     try {
@@ -138,11 +146,13 @@ const healthz: Route = async (_req, deps) => {
   const critical = warnings.filter((w) => !w.startsWith("only one"));
   const coreOk = checks.database === "ok" && checks.redis === "ok";
   const status = coreOk && checks.worker === "ok" && !critical.length ? "ok" : coreOk ? "degraded" : "down";
-  return json({
+  const body = {
     status, version: VERSION, env: deps.cfg.appEnv, runtime: "cloudflare-workers",
     backends: { database: "neon-https", queue: "upstash-rest" },
     checks, config_warnings: warnings, last_cron_age_seconds: cronAge,
-  }, coreOk ? 200 : 503);
+  };
+  healthCache = { at: Date.now(), status: coreOk ? 200 : 503, body };
+  return json(body, coreOk ? 200 : 503);
 };
 
 const metrics: Route = async (req, deps) => {
@@ -209,10 +219,11 @@ const listTasks: Route = async (req, deps) => {
 };
 
 const signedWebhook: Route = async (req, deps, ctx, [slug]) => {
-  const raw = await readBody(req, deps.cfg.maxBodyBytes);
-  const client = await repo.clientBySlug(deps.db, slug);
   const sig = (req.headers.get("x-signature-256") ?? req.headers.get("x-hub-signature-256") ?? "").replace(/^sha256=/, "");
-  if (!client || !sig) throw new HttpError(401, "invalid signature");
+  const raw = await readBody(req, deps.cfg.maxBodyBytes);
+  if (!SIG_RE.test(sig)) throw new HttpError(401, "invalid signature"); // no DB round trip for junk
+  const client = await repo.clientBySlug(deps.db, slug);
+  if (!client) throw new HttpError(401, "invalid signature");
   if (!safeEqual(sig, await hmacSha256Hex(client.webhook_secret, raw))) throw new HttpError(401, "invalid signature");
   let body: unknown;
   try {
