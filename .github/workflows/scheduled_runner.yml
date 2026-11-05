@@ -62,7 +62,7 @@ jobs:
 
       - name: Checkout (fallback drain)
         if: steps.health.outcome == 'failure' && vars.RUN_DRAIN_FALLBACK == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Drain queue inside Actions (host down)
         if: steps.health.outcome == 'failure' && vars.RUN_DRAIN_FALLBACK == 'true'
