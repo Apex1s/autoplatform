@@ -13,3 +13,8 @@ logs/
 probe_results.json
 .DS_Store
 *.local.txt
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
+worker/dist/

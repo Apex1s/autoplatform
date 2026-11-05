@@ -1,133 +1,56 @@
-# Autonomous scheduler for the deployed platform.
+# Free uptime monitor for the deployed platform (the Cloudflare Worker runs its own
+# every-minute cron for queue draining and maintenance, and never sleeps).
 #
-#  keepalive (every 10 min; on by default, disable with repo variable KEEPALIVE=false):
-#      GET /livez so a free Render service never hits its 15-min idle spin-down.
-#      Public repos: Actions minutes are free. PRIVATE repos must set KEEPALIVE=false
-#      (4,300 min/month would exceed the 2,000 free minutes).
-#  trigger (twice an hour, ~1,440 min/month):
-#      wake + GET /healthz, POST /cron/maintenance, POST /cron/provider_probe every 6h,
-#      optional queue drain inside Actions when the host is down (vars.RUN_DRAIN_FALLBACK).
-#
-# Auth: keyless. Each run mints a short-lived GitHub OIDC token (audience autoplatform-cron);
-# the app accepts it because CRON_OIDC_REPOSITORY pins this repo + main. No cron secret needed.
-# PLATFORM_URL: the deployed base URL (default below; a repo variable overrides it).
-# Optional repo variables: PLATFORM_URL, KEEPALIVE, RUN_DRAIN_FALLBACK
-# Optional secrets: CRON_TOKEN (static fallback); DATABASE_URL, UPSTASH_REDIS_URL, GROQ_API_KEY,
-#                   GEMINI_API_KEY (only for the drain fallback)
-name: scheduled-runner
+# Every 30 min: GET /healthz, retrying for ~2 min. If it isn't "ok", the run fails and
+# GitHub emails the repo owner (free alerting). Optional fallback: when the host is down
+# and RUN_DRAIN_FALLBACK=true, drain the queue inside Actions with the Python worker
+# (needs secrets DATABASE_URL, UPSTASH_REDIS_URL, GROQ_API_KEY, GEMINI_API_KEY).
+name: uptime-monitor
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
-    - cron: "17,47 * * * *"
+    - cron: "7,37 * * * *"
   workflow_dispatch:
-    inputs:
-      task:
-        description: "what to run"
-        type: choice
-        options: [maintenance, provider_probe, keepalive]
-        default: maintenance
 
 permissions:
   contents: read
 
-jobs:
-  keepalive:
-    if: >-
-      (github.event.schedule == '*/10 * * * *' && vars.KEEPALIVE != 'false') ||
-      (github.event_name == 'workflow_dispatch' && inputs.task == 'keepalive')
-    runs-on: ubuntu-latest
-    timeout-minutes: 4
-    concurrency:
-      group: keepalive
-      cancel-in-progress: true
-    env:
-      PLATFORM_URL: ${{ vars.PLATFORM_URL || '' }}
-    steps:
-      - name: Ping /livez
-        run: |
-          if [ -z "$PLATFORM_URL" ]; then echo "::notice::PLATFORM_URL not set - skipping"; exit 0; fi
-          # a failed ping is logged, never fatal (no failure emails while the host is down/undeployed)
-          curl -fsS --retry 8 --retry-delay 10 --retry-all-errors --max-time 30 "$PLATFORM_URL/livez" \
-            || echo "::warning::keep-alive ping to $PLATFORM_URL failed"
+concurrency:
+  group: uptime-monitor
+  cancel-in-progress: false
 
-  trigger:
-    if: >-
-      github.event.schedule == '17,47 * * * *' ||
-      (github.event_name == 'workflow_dispatch' && inputs.task != 'keepalive')
+jobs:
+  check:
     runs-on: ubuntu-latest
     timeout-minutes: 8
-    concurrency:
-      group: scheduled-trigger
-      cancel-in-progress: false
     permissions:
       contents: read
-      id-token: write  # mint the short-lived OIDC token the app verifies (no stored cron secret)
-      actions: write   # only used to reset GitHub's 60-day inactivity timer for this workflow
+      actions: write   # only to reset GitHub's 60-day inactivity timer for this schedule
     env:
       PLATFORM_URL: ${{ vars.PLATFORM_URL || '' }}
     steps:
-      - name: Get cron credential (GitHub OIDC, falls back to CRON_TOKEN secret)
-        id: cfg
-        env:
-          STATIC_TOKEN: ${{ secrets.CRON_TOKEN }}
-        run: |
-          if [ -z "$PLATFORM_URL" ]; then
-            echo "::notice::PLATFORM_URL not set yet - skipping."
-            echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          TOKEN=""
-          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
-            TOKEN=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=autoplatform-cron" | jq -r .value)
-          fi
-          [ -z "$TOKEN" ] && TOKEN="$STATIC_TOKEN"
-          if [ -z "$TOKEN" ]; then
-            echo "::notice::no OIDC token and no CRON_TOKEN secret - skipping."
-            echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          echo "::add-mask::$TOKEN"
-          echo "CRON_AUTH=$TOKEN" >> "$GITHUB_ENV"
-          echo "configured=true" >> "$GITHUB_OUTPUT"
-
-      - name: Wake host and check health
+      - name: Check /healthz
         id: health
-        if: steps.cfg.outputs.configured == 'true'
         continue-on-error: true
         run: |
-          for i in $(seq 1 20); do
-            code=$(curl -s -o health.json -w '%{http_code}' --max-time 30 "$PLATFORM_URL/healthz" || echo 000)
-            echo "attempt $i: HTTP $code"
-            if [ "$code" = "200" ]; then cat health.json; echo; exit 0; fi
+          if [ -z "$PLATFORM_URL" ]; then echo "::notice::PLATFORM_URL not set yet - skipping."; exit 0; fi
+          for i in $(seq 1 8); do
+            code=$(curl -s -o health.json -w '%{http_code}' --max-time 20 "$PLATFORM_URL/healthz" || echo 000)
+            status=$(python3 -c "import json;print(json.load(open('health.json')).get('status',''))" 2>/dev/null || true)
+            echo "attempt $i: HTTP $code status=$status"
+            if [ "$code" = "200" ] && [ "$status" = "ok" ]; then cat health.json; echo; exit 0; fi
             sleep 15
           done
-          cat health.json 2>/dev/null || true
-          echo "::warning::host not healthy after 5 minutes"
+          cat health.json 2>/dev/null; echo
+          echo "::error::$PLATFORM_URL is not healthy"
           exit 1
-
-      - name: Fire cron tasks
-        if: steps.cfg.outputs.configured == 'true' && steps.health.outcome == 'success'
-        run: |
-          fire() {
-            echo "firing $1"
-            curl -fsS --max-time 30 -X POST -H "Authorization: Bearer $CRON_AUTH" "$PLATFORM_URL/cron/$1"
-            echo
-          }
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            fire "${{ inputs.task }}"
-          else
-            fire maintenance
-            # provider probe every 6 hours (the :17 run of hours 0, 6, 12, 18 UTC)
-            if [ $(( 10#$(date -u +%H) % 6 )) -eq 0 ] && [ $(( 10#$(date -u +%M) )) -lt 47 ]; then fire provider_probe; fi
-          fi
 
       - name: Keep this schedule enabled (GitHub disables idle schedules after 60 days)
         if: github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # once a week is plenty; the API call resets the inactivity timer
-          if [ "$(date -u +%u)" = "1" ] && [ "$(date -u +%H)" = "00" ] && [ $(( 10#$(date -u +%M) )) -lt 47 ]; then
+          if [ "$(date -u +%u)" = "1" ] && [ "$(date -u +%H)" = "00" ] && [ $(( 10#$(date -u +%M) )) -lt 30 ]; then
             gh api -X PUT "repos/${{ github.repository }}/actions/workflows/scheduled_runner.yml/enable" && echo "schedule kept alive"
           fi
 
@@ -148,8 +71,10 @@ jobs:
           UPSTASH_REDIS_URL: ${{ secrets.UPSTASH_REDIS_URL }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GROQ_MODEL: qwen/qwen3.8-27b
-          GEMINI_MODEL: gemini-flash-lite-latest
         run: |
           pip install -q -r requirements.txt
           python -m workers.worker --drain --max-seconds 240
+
+      - name: Report
+        if: steps.health.outcome == 'failure'
+        run: exit 1

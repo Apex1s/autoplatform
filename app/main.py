@@ -202,12 +202,34 @@ def create_app(settings: Settings | None = None, *, queue: TaskQueue | None = No
             hb_age = time.monotonic() - (w.last_heartbeat_ok or 0)
             checks["worker"] = "ok" if w.alive and hb_age < 3 * settings.heartbeat_interval + 30 else "stalled"
         checks["llm_providers"] = app.state.router.configured or "none configured"
+        db_backend = "sqlite" if settings.database_url.startswith("sqlite") else "postgresql"
+        warnings = _config_warnings(db_backend)
+        critical = [w for w in warnings if not w.startswith("only one")]
         critical_ok = checks["database"] == "ok" and checks["redis"] == "ok"
-        status = "ok" if critical_ok and checks["worker"] in ("ok", "external") else (
-            "degraded" if critical_ok else "down")
+        healthy = critical_ok and checks["worker"] in ("ok", "external") and not critical
+        status = "ok" if healthy else ("degraded" if critical_ok else "down")
         body = {"status": status, "version": VERSION, "env": settings.app_env,
-                "uptime_seconds": int(time.time() - app.state.started), "checks": checks}
+                "uptime_seconds": int(time.time() - app.state.started),
+                "backends": {"database": db_backend, "queue": app.state.queue.transport},
+                "checks": checks, "config_warnings": warnings}
         return JSONResponse(body, status_code=200 if critical_ok else 503)
+
+    def _config_warnings(db_backend: str) -> list[str]:
+        """A deploy that silently fell back to SQLite / in-memory Redis must not look healthy."""
+        w: list[str] = []
+        if settings.app_env == "production":
+            if db_backend == "sqlite":
+                w.append("DATABASE_URL is not set (using local SQLite)")
+            if app.state.queue.transport == "memory":
+                w.append("UPSTASH_REDIS_URL is not set (using in-memory queue)")
+            if not settings.admin_token:
+                w.append("ADMIN_TOKEN is not set (admin API disabled)")
+        configured = app.state.router.configured
+        if not configured:
+            w.append("no LLM key set (GROQ_API_KEY / GEMINI_API_KEY)")
+        elif len(configured) == 1:
+            w.append("only one LLM provider configured: no failover")
+        return w
 
     @app.get("/metrics")
     async def metrics(format: str = "prometheus", authorization: str | None = Header(default=None)):

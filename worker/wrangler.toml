@@ -1,0 +1,26 @@
+# Cloudflare Workers (free plan: no card). Deploy: connect this repo in the Cloudflare
+# dashboard (Workers & Pages -> Create -> Import a repository, root directory "worker"),
+# or `npx wrangler deploy`. Secrets are set in the dashboard, never in this file:
+#   DATABASE_URL, UPSTASH_REDIS_URL, GROQ_API_KEY, GEMINI_API_KEY, ADMIN_TOKEN, CRON_TOKEN
+name = "autoplatform"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+[triggers]
+crons = ["* * * * *"]   # every minute: promote retries, drain the queue; maintenance at :17/:47
+
+[observability]
+enabled = true
+
+[vars]
+APP_ENV = "production"
+QUEUE_PREFIX = "ap"
+GROQ_MODEL = "qwen/qwen3.8-27b"
+GEMINI_MODEL = "gemini-flash-lite-latest"
+LLM_PROVIDER_ORDER = "groq,gemini"
+LLM_TIMEOUT_SECONDS = "20"
+JOB_TIMEOUT_SECONDS = "25"
+JOB_MAX_ATTEMPTS = "3"
+JOB_RETRY_BASE_SECONDS = "30"
+LOG_RETENTION_DAYS = "14"

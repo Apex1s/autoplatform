@@ -236,3 +236,21 @@ def test_urls_derived_from_request_when_base_url_unset(settings, make_router):
         assert creds["webhook_url"] == "https://platform.example.b4a.run/webhook"
         r = c.post("/webhook", json={"type": "echo"}, headers={"X-API-Key": creds["api_key"]}).json()
         assert r["status_url"] == f"https://platform.example.b4a.run/tasks/{r['job_id']}"
+
+
+def test_healthz_flags_unconfigured_production_deploy(settings, make_router):
+    """The Back4App lesson: a container started with no env vars fell back to SQLite +
+    in-memory Redis and still reported ok. In production that is now 'degraded' with reasons."""
+    from dataclasses import replace
+    from core.llm_router import LLMRouter
+    unconfigured = replace(settings, app_env="production", admin_token="", run_embedded_worker=False,
+                           database_url="sqlite:///./autoplatform.db", redis_url="memory://",
+                           upstash_rest_url="", upstash_rest_token="")
+    app = create_app(unconfigured, router=LLMRouter([]))
+    with TestClient(app) as c:
+        body = c.get("/healthz").json()
+    assert body["status"] == "degraded"
+    assert body["backends"] == {"database": "sqlite", "queue": "memory"}
+    joined = " | ".join(body["config_warnings"])
+    for needle in ("DATABASE_URL", "UPSTASH_REDIS_URL", "ADMIN_TOKEN", "no LLM key"):
+        assert needle in joined

@@ -26,7 +26,17 @@ on the host (Render) and as encrypted GitHub Actions secrets. `.env`, `.env.*` (
 - The container runs as a non-root user (uid 1000). CORS is not enabled.
 - Job delivery is at least once, so handlers that cause external side effects should be idempotent.
 
+## Cloudflare Worker runtime
+- The same rules as above: constant-time token comparison, SHA-256-hashed client keys (compatible
+  with the Python runtime), HMAC-SHA256 on the raw body, and the request body cap enforced before
+  auth when Content-Length is sent and while streaming otherwise.
+- `http.fetch`: https only, no credentials in URLs, private/link-local/loopback IP literals and
+  internal names refused, `redirect: manual`, and a 512 KB cap. Workers' egress can't reach private
+  networks, which covers DNS-rebinding tricks.
+- Secrets live only in Cloudflare's encrypted secret store (dashboard → Variables and Secrets).
+
 ## Rotating credentials
 1. Generate the new key in the provider's dashboard (Groq, Google AI Studio, Upstash, Neon).
-2. Update it in Render → Environment (and in GitHub Actions secrets if the drain fallback is used).
-3. Render redeploys on change. Revoke the old key afterwards.
+2. Update it in Cloudflare → Workers → autoplatform → Settings → Variables and Secrets (and in
+   GitHub Actions secrets if the drain fallback is used).
+3. Saving a secret redeploys the Worker. Revoke the old key afterwards.
