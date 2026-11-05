@@ -56,7 +56,7 @@ jobs:
 
       - name: Set up Python (fallback drain)
         if: steps.health.outcome == 'failure' && vars.RUN_DRAIN_FALLBACK == 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
