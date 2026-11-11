@@ -1,5 +1,5 @@
 # Runs on any Docker host: Back4App Containers (free, no card), Render, Hugging Face Spaces (PRO).
-FROM python:3.12-slim
+FROM python:3.15-slim
 
 # Production defaults below are not secrets; override any of them in the host's env settings.
 # Secrets (DATABASE_URL, UPSTASH_REDIS_URL, GROQ_API_KEY, GEMINI_API_KEY, ADMIN_TOKEN, CRON_TOKEN)
